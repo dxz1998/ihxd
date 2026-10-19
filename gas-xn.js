@@ -1,22 +1,24 @@
-// Variables used by Scriptable.
-// These must be at the very top of the file. Do not edit.
-// icon-color: deep orange; icon-glyph: flame.fill;
-// ============================================================
-// 兴能燃气余额小组件 (Scriptable) — 参考 ChinaGas v1.8.3 UI
-// 单文件 · 零依赖 · 不需要服务器
-// 内置: 纯JS RSA-1024 (PKCS1 v1.5) + AES-128-ECB/Pkcs7 加密
-// 数据: /api/sec/serverKey 协商 + /api/micro/bill/arrearage + accountInfo
-// 用法: 存到 Scriptable -> 首次运行填 TOKEN -> 添加桌面小组件
-// ============================================================
+/**
+ * 组件名称: 兴能燃气 (XingNeng Gas)
+ * 版本号: v1.8.3
+ * 依赖框架: DmYY
+ * 使用说明: 根据 UI 账户设置教程
+ */
 
-// ============ 配置区 ============
+if (typeof require === 'undefined') require = importModule;
+const { DmYY, Runing } = require('./DmYY');
+
+// ============================================================
+// 兴能燃气核心: 纯JS RSA-1024 + AES-128-ECB/Pkcs7 加密查询
+// (已验证: serverKey 协商 -> 加密请求 -> 解密响应)
+// ============================================================
 const CONFIG = {
   BASE_URL: 'http://wx.shuangliu.qjcode.com',
   FROM_DOMAIN_ID: '3000000007',
   CONSNO: '636550678',
   // ↓ 抓包获取的 token (JWT)。每次重新抓包后替换
   // 也支持在 Scriptable 中运行脚本 -> "填写 Token" 存到钥匙串
-  TOKEN: 'PASTE_YOUR_JWT_TOKEN_HERE',
+  TOKEN: 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJleHAiOjE3OTIzOTE3NTc0ODksInBheWxvYWQiOiJcIkF0L3VTdzhFOFFUYnkwUUVMNFJHOGs3bU9MWmwyN1hpZE83ZkNtT0NWNi9jMlR3aFdybnBPdFZ5aVRnQWYyeGVvaUVRa3RiMUVHQkhHZlpiQnQyS1Q3YUxGcTRjWXpVZzN6d2lwdTdCcU5HbzVQU0crQ3pFQ2p3aUt5SFJoeGJvRXcra2pqQmJDRDM5U01Rb00vaEw0Sk9mdjVuVDl5NmlTZ1pkZDdXQ3RDZ3ZOenFCWklZRHlvVHBPSGZkbzZQWmVaQVFVY1NnTUl4em1YNStLUTNnYkFreFh3QTRxZWFjWFJWVnYyZUVoQnJrcnFLbmZSUG5KMkdkQlNNaGhWNk8wUDh5QkxadllZd0tsWW1Dc1UvMzFFSzZiZ2RrWTVoQkZzeisxODU0UWpvPVwiIn0.PdY_HioqIotaiwq08qu07d2713PlxyBg_0z2KpgmO6M',
 };
 // 客户端固定 RSA-1024 密钥对 (仅存于本脚本, 用于解密服务端响应)
 const CLIENT_KEY = {
@@ -25,10 +27,11 @@ const CLIENT_KEY = {
   D: 'GU-vwI0VhNZbF2WSK9KPIke32q9kaJ-7FScyzE4YuKA-_DCtAyyoRjDSPs4YkkGD8mWJVTiN6WqJLG7MnbOMCpW-03AKr6Y5EpJ-TwlUDwWJ2hL2OmAUb-Kh0TLifx_fTLgivDGwQK9zcq84_zOOzEiEq9lkYTBT1vjIbbpP1rE',
   E: 'AQAB',
 };
-// 钥匙串键名 (存 Token / 缓存)
+// 钥匙串键名 (存 Token / 缓存 / 设置)
 const KEYCHAIN = {
   TOKEN: 'xl-gas.token',
   CACHE: 'xl-gas.cache',
+  SETTINGS: 'xl-gas.settings',
 };
 // ================================
 
@@ -314,8 +317,7 @@ async function postJson(urlPath, bodyObj, headers) {
   req.body = JSON.stringify(bodyObj);
   return await req.loadJSON();
 }
-async function callEncrypted(path, payload) {
-  const token = getToken();
+async function callEncrypted(path, payload, token) {
   const commonHdrs = { token, fromDomainId: CONFIG.FROM_DOMAIN_ID, part: 'WECHAT' };
   const sk = await postJson('/api/sec/serverKey', { key: CLIENT_KEY.PUB_SPKI_B64, data: '' }, commonHdrs);
   if (!sk || !sk.obj) throw new Error('协商失败');
@@ -332,647 +334,1389 @@ async function callEncrypted(path, payload) {
   if (plain.success === false) throw new Error(plain.msg || '接口返回失败');
   return plain;
 }
-async function queryBalance() {
-  const ar = await callEncrypted('/api/micro/bill/arrearage', { consNo: CONFIG.CONSNO });
-  const ac = await callEncrypted('/api/micro/bill/accountInfo', { consNo: CONFIG.CONSNO });
+async function queryBalance(token, consNo) {
+  const ar = await callEncrypted('/api/micro/bill/arrearage', { consNo }, token);
+  const ac = await callEncrypted('/api/micro/bill/accountInfo', { consNo }, token);
   const a = ar.obj || {}, b = ac.obj || {};
+  // 抄表记录: 取最新一条 (pageNo=1 首页第一条即最近抄表)
+  let lastRecord = null;
+  let lastRecordTime = null;
+  try {
+    const mr = await callEncrypted('/api/micro/readMeter/mrInfo', { consNo, pageNo: 1, pageSize: 10 }, token);
+    if (mr && Array.isArray(mr.obj) && mr.obj.length > 0) {
+      const first = mr.obj[0];
+      lastRecord = first.thisNum != null && first.thisNum !== '' ? String(first.thisNum) : (first.lastNum != null ? String(first.lastNum) : null);
+      lastRecordTime = first.thisYmd || first.lastMrDate || null;
+    }
+  } catch (_) {
+    // 抄表接口失败不影响余额展示
+  }
+  // 用 token 提取服务单位 / 微信用户ID (失败不影响主数据)
+  let companyName = null;
+  let wechatUserId = null;
+  try {
+    const ci = await callEncrypted('/api/companyInfo/curentInfo', {}, token);
+    if (ci && ci.obj && ci.obj.name) companyName = ci.obj.name;
+  } catch (_) {}
+  try {
+    const ui = await callEncrypted('/api/my/getUserInfo', {}, token);
+    if (ui && ui.obj && ui.obj.weixinAccount) wechatUserId = ui.obj.weixinAccount;
+  } catch (_) {}
   return {
     balance: a.balance ?? b.presBalance ?? null,
     arrears: a.amt ?? a.allFee ?? null,
     lastBalance: a.lastBalance ?? null,
-    consNo: b.consNo || a.consNo || CONFIG.CONSNO,
+    consNo: b.consNo || a.consNo || consNo,
     consName: b.userName || a.yhmc || '',
     gasPropName: b.gasPropName || '',
     gasAddress: b.gasAddress || a.yhdz || '',
     preBalanceTime: a.preBalanceTime || null,
+    lastRecord: lastRecord,
+    lastRecordTime: lastRecordTime,
+    companyName: companyName,
+    wechatUserId: wechatUserId,
     updatedAt: Date.now(),
   };
 }
 
-// ================= UI (参考 ChinaGas v1.8.3) =================
-const UI_SETTINGS = {
-  alias: '兴能燃气',
-  themeColor: '#FF9500',
-  balanceColor: '#10B981',
-  balanceLimit: 500,     // 进度条满额基准(元), 余额达到此值进度条全亮
-  intervalMin: 360,      // 刷新间隔(分钟)
-  useGradientBar: true,
-  maskCustCode: true,
-};
-const tone = (light, dark) => Color.dynamic(new Color(light), new Color(dark));
-const subColor = () => tone('#6B7280', '#9CA3AF');
-const cardColor = () => tone('#F8FAFC', '#161E2E');
-const cardLite = () => tone('#F3F4F6', '#1F2937');
-const bgWhite = () => tone('#FFFFFF', '#111827');
-const dividerColor = () => tone('#E5E7EB', '#1F2937');
-const widgetColor = () => tone('#111827', '#F9FAFB');
+// ============================================================
+// 兴能燃气小组件 (基于 ChinaGas v1.8.3 原版, 仅替换核心数据)
+// 依赖框架: DmYY
+// 使用说明: 根据 UI 账户设置教程
+// ============================================================
 
-function getScale() {
-  try {
-    const s = Device.screenSize();
-    const map = [
-      [440, 956, 1.0], [430, 932, 0.98], [428, 926, 0.97], [414, 896, 0.95],
-      [402, 874, 0.93], [393, 852, 0.90], [390, 844, 0.89], [375, 812, 0.85],
-    ];
-    const m = map.find(d => (d[0] === s.width && d[1] === s.height) || (d[0] === s.height && d[1] === s.width));
-    return m ? m[2] : 0.95;
-  } catch (_) { return 0.95; }
-}
-function getLargeWidth() {
-  try {
-    const s = Device.screenSize();
-    const map = [
-      [440, 956, 368], [430, 932, 364], [428, 926, 364], [414, 896, 360],
-      [402, 874, 348], [393, 852, 338], [390, 844, 338], [375, 812, 329],
-    ];
-    const m = map.find(d => (d[0] === Math.min(s.width, s.height) && d[1] === Math.max(s.width, s.height)));
-    return m ? m[2] : 338;
-  } catch (_) { return 338; }
-}
-function formatMoney(num) {
-  const v = parseFloat(num);
-  return isNaN(v) ? '0.00' : v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-function maskCode(code) {
-  if (!code) return '--';
-  const s = String(code);
-  if (s.length >= 8) return s.slice(0, 3) + '****' + s.slice(-2);
-  return '****' + s.slice(-2);
-}
-function shortCode(code) {
-  if (!code) return '--';
-  const s = String(code);
-  return s.length > 5 ? s.slice(-5) : s;
-}
-function formatCompName(name) {
-  const raw = (name || '').trim();
-  if (!raw || raw === 'undefined' || raw === 'null') return '兴能燃气';
-  return raw.replace(/有限责任公司|有限公司|天然气发展有限公司/g, '');
-}
-function getBalanceRatio(data) {
-  const isOwe = data.arrears && parseFloat(data.arrears) > 0;
-  if (isOwe) return 0;
-  const bal = parseFloat(data.balance);
-  if (isNaN(bal) || bal <= 0) return 0;
-  const maxLimit = parseFloat(UI_SETTINGS.balanceLimit) || 500;
-  return Math.max(0, Math.min(1.0, bal / maxLimit));
-}
-function getCapsuleActiveCount(data, total = 10) {
-  const isOwe = data.arrears && parseFloat(data.arrears) > 0;
-  if (isOwe) return 1;
-  const ratio = getBalanceRatio(data);
-  if (ratio <= 0) return 0;
-  return Math.max(1, Math.round(ratio * total));
-}
-function getBarColors(data) {
-  if (!UI_SETTINGS.useGradientBar) {
-    const single = UI_SETTINGS.themeColor;
-    return { start: single, end: single };
-  }
-  const isOwe = data.arrears && parseFloat(data.arrears) > 0;
-  if (isOwe) return { start: '#EF4444', end: '#DC2626' };
-  const ratio = getBalanceRatio(data);
-  if (ratio >= 0.8) return { start: '#10B981', end: '#34D399' };
-  if (ratio >= 0.6) return { start: '#06B6D4', end: '#22D3EE' };
-  if (ratio >= 0.4) return { start: '#EAB308', end: '#FACC15' };
-  if (ratio >= 0.2) return { start: '#F97316', end: '#FB923C' };
-  return { start: '#EF4444', end: '#F87171' };
-}
-function interpolateColor(c1hex, c2hex, factor) {
-  try {
-    const c1 = parseInt(c1hex.replace('#', ''), 16);
-    const c2 = parseInt(c2hex.replace('#', ''), 16);
-    const r = Math.round(((c1 >> 16) & 255) + (((c2 >> 16) & 255) - ((c1 >> 16) & 255)) * factor);
-    const g = Math.round(((c1 >> 8) & 255) + (((c2 >> 8) & 255) - ((c1 >> 8) & 255)) * factor);
-    const b = Math.round((c1 & 255) + ((c2 & 255) - (c1 & 255)) * factor);
-    return new Color('#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1));
-  } catch (_) { return new Color(c1hex); }
-}
-function drawCapsuleBar(width, height, totalSegments, activeSegments, colors) {
-  const dc = new DrawContext();
-  dc.size = new Size(width, height);
-  dc.opaque = false;
-  dc.respectScreenScale = true;
-  const gap = 3.5;
-  const segW = (width - gap * (totalSegments - 1)) / totalSegments;
-  const corner = height / 2;
-  const bg = Color.dynamic(new Color('#E5E7EB'), new Color('#374151'));
-  for (let i = 0; i < totalSegments; i++) {
-    const x = i * (segW + gap);
-    const path = new Path();
-    path.addRoundedRect(new Rect(x, 0, segW, height), corner, corner);
-    dc.addPath(path);
-    if (i < activeSegments) {
-      const f = activeSegments > 1 ? (i / (activeSegments - 1)) : 0;
-      dc.setFillColor(interpolateColor(colors.start, colors.end, f));
-    } else {
-      dc.setFillColor(bg);
+class Widget extends DmYY {
+  version = '1.8.3';
+
+  SCALE = 1;
+  gasData = null;
+  isOffline = false;
+
+  constructor(arg) {
+    super(arg);
+    this.name = '兴能燃气';
+    this.en = 'XingNengGas';
+    this.logo = 'https://raw.githubusercontent.com/anker1209/Scriptable/main/icon/gas.png';
+    this.fm = FileManager.local();
+    this.cachePath = this.fm.joinPath(this.fm.documentsDirectory(), 'XingNengGas_Cache');
+
+    if (typeof this.Run === 'function') {
+      this.Run();
     }
-    dc.fillPath();
   }
-  return dc.getImage();
-}
-// ---- 小号 ----
-function renderSmall(w, data, isOffline) {
-  const SCALE = getScale();
-  const pX = 14 * SCALE, pY = 12 * SCALE;
-  w.setPadding(pY, pX, pY, pX);
-  w.backgroundColor = bgWhite();
-  const themeColor = new Color(UI_SETTINGS.themeColor);
-  const balanceColor = new Color(UI_SETTINGS.balanceColor);
-  const sub = subColor();
-  const isOwe = data.arrears && parseFloat(data.arrears) > 0;
-  const body = w.addStack();
-  body.layoutVertically();
-  // header
-  const header = body.addStack();
-  header.centerAlignContent();
-  const flame = SFSymbol.named('flame.fill');
-  flame.applyHeavyWeight();
-  const icon = header.addImage(flame.image);
-  icon.imageSize = new Size(16 * SCALE, 16 * SCALE);
-  icon.tintColor = themeColor;
-  header.addSpacer(5);
-  const title = header.addText(UI_SETTINGS.alias);
-  title.font = Font.boldSystemFont(13 * SCALE);
-  title.textColor = widgetColor();
-  header.addSpacer();
-  const pill = header.addStack();
-  pill.centerAlignContent();
-  pill.backgroundColor = tone('#F3F4F6', '#1F2937');
-  pill.cornerRadius = 6 * SCALE;
-  pill.setPadding(2 * SCALE, 6 * SCALE, 2 * SCALE, 6 * SCALE);
-  const pillT = pill.addText(isOffline ? '离线' : '● 正常');
-  pillT.font = Font.semiboldSystemFont(9.5 * SCALE);
-  pillT.textColor = isOffline ? themeColor : balanceColor;
-  body.addSpacer();
-  // 余额
-  const labelRow = body.addStack();
-  labelRow.centerAlignContent();
-  const balLabel = labelRow.addText(isOwe ? '燃气欠费' : '账户余额');
-  balLabel.font = Font.mediumSystemFont(11 * SCALE);
-  balLabel.textColor = isOwe ? new Color('#EF4444') : sub;
-  body.addSpacer(2 * SCALE);
-  const valRow = body.addStack();
-  valRow.centerAlignContent();
-  const valText = valRow.addText(`¥ ${formatMoney(data.balance)}`);
-  valText.font = Font.boldRoundedSystemFont(27 * SCALE);
-  valText.textColor = isOwe ? new Color('#EF4444') : balanceColor;
-  valText.lineLimit = 1;
-  valText.minimumScaleFactor = 0.6;
-  body.addSpacer(6 * SCALE);
-  // 胶囊进度条
-  const active = getCapsuleActiveCount(data, 10);
-  const colors = getBarColors(data);
-  const capImg = body.addImage(drawCapsuleBar(130 * SCALE, 5.5 * SCALE, 10, active, colors));
-  capImg.imageSize = new Size(130 * SCALE, 5.5 * SCALE);
-  body.addSpacer();
-  // 底部卡片
-  const card = body.addStack();
-  card.layoutVertically();
-  card.backgroundColor = cardColor();
-  card.cornerRadius = 8 * SCALE;
-  card.setPadding(6 * SCALE, 8 * SCALE, 6 * SCALE, 8 * SCALE);
-  const r1 = card.addStack();
-  r1.centerAlignContent();
-  const gIcon = SFSymbol.named('gauge.badge.plus');
-  const gImg = r1.addImage(gIcon.image);
-  gImg.imageSize = new Size(11 * SCALE, 11 * SCALE);
-  gImg.tintColor = themeColor;
-  r1.addSpacer(3);
-  const mText = r1.addText(`上期: ¥${formatMoney(data.lastBalance)}`);
-  mText.font = Font.systemFont(9.5 * SCALE);
-  mText.textColor = sub;
-  r1.addSpacer();
-  const timeText = r1.addText(stamp(data.updatedAt));
-  timeText.font = Font.systemFont(9.5 * SCALE);
-  timeText.textColor = sub;
-  card.addSpacer(3 * SCALE);
-  const r2 = card.addStack();
-  r2.centerAlignContent();
-  const idIcon = SFSymbol.named('creditcard');
-  const idImg = r2.addImage(idIcon.image);
-  idImg.imageSize = new Size(11 * SCALE, 11 * SCALE);
-  idImg.tintColor = new Color('#3B82F6');
-  r2.addSpacer(3);
-  const codeText = r2.addText(`户号: ${UI_SETTINGS.maskCustCode ? maskCode(data.consNo) : shortCode(data.consNo)}`);
-  codeText.font = Font.systemFont(9.5 * SCALE);
-  codeText.textColor = sub;
-  r2.addSpacer();
-  const nameText = r2.addText(data.consName || '兴能燃气');
-  nameText.font = Font.systemFont(9.5 * SCALE);
-  nameText.textColor = sub;
-  return w;
-}
-// ---- 中号 ----
-function renderMedium(w, data, isOffline) {
-  const SCALE = getScale();
-  const pX = 16 * SCALE, pY = 12 * SCALE;
-  w.setPadding(pY, pX, pY, pX);
-  w.backgroundColor = bgWhite();
-  const themeColor = new Color(UI_SETTINGS.themeColor);
-  const balanceColor = new Color(UI_SETTINGS.balanceColor);
-  const sub = subColor();
-  const isOwe = data.arrears && parseFloat(data.arrears) > 0;
-  const body = w.addStack();
-  body.layoutHorizontally();
-  const left = body.addStack();
-  left.layoutVertically();
-  left.size = new Size(155 * SCALE, 0);
-  // 左 header
-  const lH = left.addStack();
-  lH.centerAlignContent();
-  const flame = SFSymbol.named('flame.fill');
-  flame.applyHeavyWeight();
-  const fImg = lH.addImage(flame.image);
-  fImg.imageSize = new Size(16 * SCALE, 16 * SCALE);
-  fImg.tintColor = themeColor;
-  lH.addSpacer(5);
-  const lTitle = lH.addText(UI_SETTINGS.alias);
-  lTitle.font = Font.boldSystemFont(13 * SCALE);
-  lTitle.textColor = widgetColor();
-  left.addSpacer();
-  const balLabel = left.addText(isOwe ? '燃气欠费 (元)' : '账户余额 (元)');
-  balLabel.font = Font.mediumSystemFont(11 * SCALE);
-  balLabel.textColor = isOwe ? new Color('#EF4444') : sub;
-  left.addSpacer(2 * SCALE);
-  const valRow = left.addStack();
-  valRow.centerAlignContent();
-  const valText = valRow.addText(`¥ ${formatMoney(data.balance)}`);
-  valText.font = Font.boldRoundedSystemFont(28 * SCALE);
-  valText.textColor = isOwe ? new Color('#EF4444') : balanceColor;
-  valText.lineLimit = 1;
-  valText.minimumScaleFactor = 0.6;
-  left.addSpacer(7 * SCALE);
-  const active = getCapsuleActiveCount(data, 10);
-  const colors = getBarColors(data);
-  const capImg = left.addImage(drawCapsuleBar(148 * SCALE, 7 * SCALE, 10, active, colors));
-  capImg.imageSize = new Size(148 * SCALE, 7 * SCALE);
-  left.addSpacer();
-  const stateRow = left.addStack();
-  stateRow.centerAlignContent();
-  const dot = stateRow.addText('● ');
-  dot.font = Font.systemFont(8 * SCALE);
-  dot.textColor = isOwe ? new Color('#EF4444') : balanceColor;
-  const stateT = stateRow.addText(isOwe ? '账户已欠费 · 请及时充值' : isOffline ? '离线数据 · 网络不可用' : '账户正常 · 民用阶梯');
-  stateT.font = Font.systemFont(10 * SCALE);
-  stateT.textColor = sub;
-  body.addSpacer(12 * SCALE);
-  const divider = body.addStack();
-  divider.size = new Size(1, 0);
-  divider.backgroundColor = dividerColor();
-  body.addSpacer(12 * SCALE);
-  const right = body.addStack();
-  right.layoutVertically();
-  const rTop = right.addStack();
-  rTop.centerAlignContent();
-  const syncSym = SFSymbol.named('arrow.triangle.2.circlepath');
-  const syncImg = rTop.addImage(syncSym.image);
-  syncImg.imageSize = new Size(10 * SCALE, 10 * SCALE);
-  syncImg.tintColor = sub;
-  rTop.addSpacer(3);
-  const syncT = rTop.addText(`更新 ${stamp(data.updatedAt)}`);
-  syncT.font = Font.systemFont(10 * SCALE);
-  syncT.textColor = sub;
-  rTop.addSpacer();
-  right.addSpacer();
-  techRow(right, 'person.crop.rectangle', '客户户号', `${data.consName || '--'}`, themeColor, sub, SCALE);
-  right.addSpacer();
-  techRow(right, 'number', '燃气户号', UI_SETTINGS.maskCustCode ? maskCode(data.consNo) : String(data.consNo || '--'), new Color('#3B82F6'), sub, SCALE);
-  right.addSpacer();
-  techRow(right, 'speedometer', '上期余额', `¥${formatMoney(data.lastBalance)}`, new Color('#8B5CF6'), sub, SCALE);
-  right.addSpacer();
-  techRow(right, 'building.2', '服务单位', formatCompName('双流兴能天然气有限责任公司'), new Color('#10B981'), sub, SCALE);
-  return w;
-}
-function techRow(parent, iconName, label, valStr, iconCol, subCol, SCALE) {
-  const r = parent.addStack();
-  r.centerAlignContent();
-  const sym = SFSymbol.named(iconName);
-  const img = r.addImage(sym.image);
-  img.imageSize = new Size(13 * SCALE, 13 * SCALE);
-  img.tintColor = iconCol;
-  r.addSpacer(4);
-  const lT = r.addText(label);
-  lT.font = Font.systemFont(10.5 * SCALE);
-  lT.textColor = subCol;
-  r.addSpacer(6);
-  const vT = r.addText(valStr);
-  vT.font = Font.semiboldSystemFont(11 * SCALE);
-  vT.textColor = widgetColor();
-  vT.lineLimit = 1;
-  vT.minimumScaleFactor = 0.7;
-  r.addSpacer();
-}
-// ---- 大号 ----
-function renderLarge(w, data, isOffline) {
-  const SCALE = getScale();
-  const pX = 16 * SCALE, pY = 14 * SCALE;
-  w.setPadding(pY, pX, pY, pX);
-  w.backgroundColor = bgWhite();
-  const themeColor = new Color(UI_SETTINGS.themeColor);
-  const balanceColor = new Color(UI_SETTINGS.balanceColor);
-  const sub = subColor();
-  const isOwe = data.arrears && parseFloat(data.arrears) > 0;
-  const body = w.addStack();
-  body.layoutVertically();
-  // header
-  const header = body.addStack();
-  header.centerAlignContent();
-  const flame = SFSymbol.named('flame.fill');
-  flame.applyHeavyWeight();
-  const fImg = header.addImage(flame.image);
-  fImg.imageSize = new Size(20 * SCALE, 20 * SCALE);
-  fImg.tintColor = themeColor;
-  header.addSpacer(6);
-  const title = header.addText(UI_SETTINGS.alias);
-  title.font = Font.boldSystemFont(15 * SCALE);
-  title.textColor = widgetColor();
-  header.addSpacer();
-  const badge = header.addStack();
-  badge.centerAlignContent();
-  badge.backgroundColor = tone('#F3F4F6', '#1F2937');
-  badge.cornerRadius = 6 * SCALE;
-  badge.setPadding(3 * SCALE, 8 * SCALE, 3 * SCALE, 8 * SCALE);
-  const tag = badge.addText(isOffline ? '离线模式' : `更新 ${stamp(data.updatedAt)}`);
-  tag.font = Font.semiboldSystemFont(10 * SCALE);
-  tag.textColor = isOffline ? themeColor : balanceColor;
-  body.addSpacer();
-  // 余额卡片
-  const card = body.addStack();
-  card.layoutVertically();
-  card.backgroundColor = cardColor();
-  card.cornerRadius = 14 * SCALE;
-  card.setPadding(12 * SCALE, 16 * SCALE, 12 * SCALE, 16 * SCALE);
-  const cLabel = card.addText(isOwe ? '账户欠费总额 (元)' : '当前账户余额 (元)');
-  cLabel.font = Font.mediumSystemFont(11.5 * SCALE);
-  cLabel.textColor = isOwe ? new Color('#EF4444') : sub;
-  card.addSpacer(3 * SCALE);
-  const cValRow = card.addStack();
-  cValRow.centerAlignContent();
-  const val = cValRow.addText(`¥ ${formatMoney(data.balance)}`);
-  val.font = Font.boldRoundedSystemFont(33 * SCALE);
-  val.textColor = isOwe ? new Color('#EF4444') : balanceColor;
-  card.addSpacer(7 * SCALE);
-  const contentW = getLargeWidth() - 2 * pX;
-  const barW = Math.max(260 * SCALE, contentW - 32 * SCALE);
-  const active = getCapsuleActiveCount(data, 14);
-  const colors = getBarColors(data);
-  const cap = card.addImage(drawCapsuleBar(barW, 8 * SCALE, 14, active, colors));
-  cap.imageSize = new Size(barW, 8 * SCALE);
-  body.addSpacer();
-  // 三卡片
-  const grid = body.addStack();
-  grid.layoutHorizontally();
-  const gap = 8 * SCALE;
-  const colW = Math.floor((contentW - 2 * gap) / 3);
-  const colW3 = contentW - 2 * gap - 2 * colW;
-  const cardA = grid.addStack();
-  cardA.layoutVertically();
-  cardA.backgroundColor = cardLite();
-  cardA.cornerRadius = 10 * SCALE;
-  cardA.setPadding(9 * SCALE, 9 * SCALE, 9 * SCALE, 9 * SCALE);
-  cardA.size = new Size(colW, 0);
-  const aHead = cardA.addStack();
-  aHead.centerAlignContent();
-  const aIcon = SFSymbol.named('speedometer');
-  const aImg = aHead.addImage(aIcon.image);
-  aImg.imageSize = new Size(12 * SCALE, 12 * SCALE);
-  aImg.tintColor = new Color('#3B82F6');
-  aHead.addSpacer(3 * SCALE);
-  const aTitle = aHead.addText('上期余额');
-  aTitle.font = Font.systemFont(10 * SCALE);
-  aTitle.textColor = sub;
-  aTitle.lineLimit = 1;
-  cardA.addSpacer(4 * SCALE);
-  const aVal = cardA.addText(`¥${formatMoney(data.lastBalance)}`);
-  aVal.font = Font.boldRoundedSystemFont(16 * SCALE);
-  aVal.textColor = widgetColor();
-  aVal.lineLimit = 1;
-  aVal.minimumScaleFactor = 0.8;
-  grid.addSpacer(gap);
-  const cardB = grid.addStack();
-  cardB.layoutVertically();
-  cardB.backgroundColor = cardLite();
-  cardB.cornerRadius = 10 * SCALE;
-  cardB.setPadding(9 * SCALE, 9 * SCALE, 9 * SCALE, 9 * SCALE);
-  cardB.size = new Size(colW, 0);
-  const bHead = cardB.addStack();
-  bHead.centerAlignContent();
-  const bIcon = SFSymbol.named('flame.circle');
-  const bImg = bHead.addImage(bIcon.image);
-  bImg.imageSize = new Size(12 * SCALE, 12 * SCALE);
-  bImg.tintColor = new Color('#8B5CF6');
-  bHead.addSpacer(3 * SCALE);
-  const bTitle = bHead.addText('气价类型');
-  bTitle.font = Font.systemFont(10 * SCALE);
-  bTitle.textColor = sub;
-  bTitle.lineLimit = 1;
-  cardB.addSpacer(4 * SCALE);
-  const bVal = cardB.addText(data.gasPropName || '--');
-  bVal.font = Font.boldRoundedSystemFont(13.5 * SCALE);
-  bVal.textColor = widgetColor();
-  bVal.lineLimit = 1;
-  bVal.minimumScaleFactor = 0.8;
-  grid.addSpacer(gap);
-  const cardC = grid.addStack();
-  cardC.layoutVertically();
-  cardC.backgroundColor = cardLite();
-  cardC.cornerRadius = 10 * SCALE;
-  cardC.setPadding(9 * SCALE, 9 * SCALE, 9 * SCALE, 9 * SCALE);
-  cardC.size = new Size(colW3, 0);
-  const cHead = cardC.addStack();
-  cHead.centerAlignContent();
-  const cIcon = SFSymbol.named('waveform.path.ecg');
-  const cImg = cHead.addImage(cIcon.image);
-  cImg.imageSize = new Size(12 * SCALE, 12 * SCALE);
-  const statusCol = isOwe ? new Color('#EF4444') : (isOffline ? themeColor : balanceColor);
-  cImg.tintColor = statusCol;
-  cHead.addSpacer(3 * SCALE);
-  const cTitle = cHead.addText('账户状态');
-  cTitle.font = Font.systemFont(10 * SCALE);
-  cTitle.textColor = sub;
-  cTitle.lineLimit = 1;
-  cardC.addSpacer(4 * SCALE);
-  const cRow = cardC.addStack();
-  cRow.centerAlignContent();
-  const cDot = cRow.addText('● ');
-  cDot.font = Font.systemFont(7 * SCALE);
-  cDot.textColor = statusCol;
-  const cValT = isOwe ? '账户欠费' : (isOffline ? '离线保持' : '余额充足');
-  const cVal = cRow.addText(cValT);
-  cVal.font = Font.boldSystemFont(12 * SCALE);
-  cVal.textColor = widgetColor();
-  cVal.lineLimit = 1;
-  cVal.minimumScaleFactor = 0.8;
-  body.addSpacer();
-  // 列表卡
-  const listCard = body.addStack();
-  listCard.layoutVertically();
-  listCard.backgroundColor = cardColor();
-  listCard.cornerRadius = 10 * SCALE;
-  listCard.setPadding(10 * SCALE, 14 * SCALE, 10 * SCALE, 14 * SCALE);
-  techRow(listCard, 'person.crop.rectangle', '客户姓名', data.consName || '--', themeColor, sub, SCALE);
-  listCard.addSpacer(6 * SCALE);
-  techRow(listCard, 'number', '燃气户号', UI_SETTINGS.maskCustCode ? maskCode(data.consNo) : String(data.consNo || '--'), new Color('#3B82F6'), sub, SCALE);
-  listCard.addSpacer(6 * SCALE);
-  techRow(listCard, 'building.2', '服务单位', formatCompName('双流兴能天然气有限责任公司'), new Color('#10B981'), sub, SCALE);
-  listCard.addSpacer(6 * SCALE);
-  techRow(listCard, 'phone.badge.waveform', '服务热线', '028-85860568', new Color('#F59E0B'), sub, SCALE);
-  return w;
-}
-// ---- 占位/错误 ----
-function renderGuideWidget(w) {
-  w.setPadding(16, 16, 16, 16);
-  w.backgroundColor = bgWhite();
-  const center = w.addStack();
-  center.layoutVertically();
-  center.centerAlignContent();
-  const title = center.addText('兴能燃气');
-  title.font = Font.boldSystemFont(15);
-  title.textColor = new Color('#FF9500');
-  center.addSpacer(8);
-  const tip = center.addText('未检测到 Token 配置');
-  tip.font = Font.boldSystemFont(12);
-  tip.textColor = widgetColor();
-  center.addSpacer(4);
-  const desc = center.addText('请点击打开组件，选择「填写 Token」。');
-  desc.font = Font.systemFont(11);
-  desc.textColor = new Color('#9CA3AF');
-  desc.centerAlignText();
-  return w;
-}
-function renderErrorWidget(w, msg) {
-  w.setPadding(16, 16, 16, 16);
-  w.backgroundColor = bgWhite();
-  const center = w.addStack();
-  center.layoutVertically();
-  center.centerAlignContent();
-  const title = center.addText('数据连接失败');
-  title.font = Font.boldSystemFont(14);
-  title.textColor = new Color('#EF4444');
-  center.addSpacer(6);
-  const m = center.addText((msg || '网络超时且无离线缓存，请检查网络或重新配置 Token。').slice(0, 60));
-  m.font = Font.systemFont(11);
-  m.textColor = new Color('#9CA3AF');
-  m.centerAlignText();
-  m.lineLimit = 4;
-  return w;
-}
-function makeWidget(result, family) {
-  const w = new ListWidget();
-  w.refreshAfterDate = new Date(Date.now() + 1000 * 60 * UI_SETTINGS.intervalMin);
-  w.url = URLScheme.forRunningScript();
-  const d = result.data;
-  if (family === 'medium') return renderMedium(w, d, result.stale);
-  if (family === 'large') return renderLarge(w, d, result.stale);
-  return renderSmall(w, d, result.stale);
-}
-function stamp(ms) {
-  if (!ms) return '--';
-  const d = new Date(ms);
-  const p = v => String(v).padStart(2, '0');
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
-function placeholder(hint) {
-  const family = config.widgetFamily || 'medium';
-  const w = new ListWidget();
-  w.refreshAfterDate = new Date(Date.now() + 1000 * 60 * UI_SETTINGS.intervalMin);
-  w.url = URLScheme.forRunningScript();
-  if (family === 'medium') return renderGuideWidget(w);
-  if (family === 'large') return renderGuideWidget(w);
-  return renderGuideWidget(w);
-}
 
-// ================= 缓存 =================
-function readCache() {
-  try { if (Keychain.contains(KEYCHAIN.CACHE)) return JSON.parse(Keychain.get(KEYCHAIN.CACHE)); } catch (_) {}
-  return null;
-}
-function writeCache(data) {
-  try { Keychain.set(KEYCHAIN.CACHE, JSON.stringify(data)); } catch (_) {}
-}
-function readTokenCfg() {
-  try { if (Keychain.contains(KEYCHAIN.TOKEN)) return Keychain.get(KEYCHAIN.TOKEN).trim(); } catch (_) {}
-  return '';
-}
+  loadCache(key) {
+    try {
+      const file = this.fm.joinPath(this.cachePath, key);
+      if (this.fm.fileExists(file)) {
+        return this.fm.readString(file);
+      }
+    } catch (_) {}
+    return null;
+  }
 
-// ================= 主流程 =================
-async function runWidget() {
-  const family = config.widgetFamily || 'medium';
-  let cached = null;
-  try { cached = readCache(); } catch (_) {}
-  if (cached && cached.updatedAt && Date.now() - cached.updatedAt < UI_SETTINGS.intervalMin * 60 * 1000) {
-    Script.setWidget(makeWidget({ data: cached, updatedAt: cached.updatedAt, stale: false }, family));
-    Script.complete();
+  saveCache(key, content) {
+    try {
+      if (!this.fm.fileExists(this.cachePath)) {
+        this.fm.createDirectory(this.cachePath, true);
+      }
+      const file = this.fm.joinPath(this.cachePath, key);
+      this.fm.writeString(file, content);
+    } catch (_) {}
+  }
+
+  readStorage(key) {
+    return this.loadCache(key);
+  }
+
+  writeStorage(key, content) {
+    return this.saveCache(key, content);
+  }
+
+  clearStorage() {
+    try {
+      if (this.fm.fileExists(this.cachePath)) {
+        this.fm.remove(this.cachePath);
+      }
+    } catch (_) {}
+  }
+
+  async init() {
+    this.settings.alias = this.settings.alias || '兴能燃气';
+    this.settings.themeColor = this.settings.themeColor || '#FF9500';
+    this.settings.balanceColor = this.settings.balanceColor || '#10B981';
+    this.settings.interval = this.settings.interval || '360';
+    this.settings.balanceLimit = this.settings.balanceLimit || '500';
+    if (this.settings.useGradientBar === undefined) {
+      this.settings.useGradientBar = 'true';
+    }
+
+    this.SCALE = this.getWidgetScaleFactor();
+    await this.fetchGasInfo(false);
+  }
+
+  getWidgetScaleFactor() {
+    try {
+      const deviceSize = Device.screenSize();
+      const screenData = [
+        { width: 440, height: 956, scale: 1.0 },
+        { width: 430, height: 932, scale: 0.98 },
+        { width: 428, height: 926, scale: 0.97 },
+        { width: 414, height: 896, scale: 0.95 },
+        { width: 402, height: 874, scale: 0.93 },
+        { width: 393, height: 852, scale: 0.90 },
+        { width: 390, height: 844, scale: 0.89 },
+        { width: 375, height: 812, scale: 0.85 },
+      ];
+      const match = screenData.find(
+        d => (d.width === deviceSize.width && d.height === deviceSize.height) ||
+             (d.width === deviceSize.height && d.height === deviceSize.width)
+      );
+      return match ? match.scale : 0.95;
+    } catch (_) {
+      return 0.95;
+    }
+  }
+
+  getWidgetLargeWidth() {
+    try {
+      const deviceSize = Device.screenSize();
+      const screenW = Math.min(deviceSize.width, deviceSize.height);
+      const screenH = Math.max(deviceSize.width, deviceSize.height);
+      const sizes = [
+        { w: 440, h: 956, largeW: 368 },
+        { w: 430, h: 932, largeW: 364 },
+        { w: 428, h: 926, largeW: 364 },
+        { w: 414, h: 896, largeW: 360 },
+        { w: 402, h: 874, largeW: 348 },
+        { w: 393, h: 852, largeW: 338 },
+        { w: 390, h: 844, largeW: 338 },
+        { w: 375, h: 812, largeW: 329 },
+      ];
+      const match = sizes.find(s => s.w === screenW && s.h === screenH);
+      return match ? match.largeW : 338;
+    } catch (_) {
+      return 338;
+    }
+  }
+
+  getColor() {
+    if (this.settings && this.settings.lightColor && this.settings.darkColor) {
+      return Color.dynamic(
+        new Color(this.settings.lightColor),
+        new Color(this.settings.darkColor)
+      );
+    }
+    return Color.dynamic(new Color('#111827'), new Color('#F9FAFB'));
+  }
+
+  async fetchGasInfo(force = false) {
+    const consNo = (this.settings.custCode || '').trim();
+    const token = (this.settings.xMasAppInfo || '').trim();
+
+    const cacheKey = `gas_cache_${consNo || 'default'}.json`;
+    const intervalMin = parseInt(this.settings.interval) || 360;
+
+    let cachedData = null;
+    const cacheStr = this.loadCache(cacheKey);
+    if (cacheStr) {
+      try {
+        cachedData = JSON.parse(cacheStr);
+      } catch (_) {
+        cachedData = null;
+      }
+    }
+
+    if (!consNo || !token) {
+      if (cachedData) {
+        this.gasData = cachedData;
+        this.isOffline = true;
+      } else {
+        this.gasData = null;
+      }
+      return;
+    }
+
+    if (!force && cachedData && cachedData._updateTimestamp) {
+      const elapsedMin = Math.floor((Date.now() - cachedData._updateTimestamp) / 1000 / 60);
+      if (elapsedMin >= 0 && elapsedMin < intervalMin) {
+        console.log(`[XingNengGas] 命中沙盒缓存：上次更新于 ${elapsedMin} 分钟前（数据读取间隔: ${intervalMin} 分钟），直接读取本地数据，跳过网络请求`);
+        this.gasData = cachedData;
+        this.isOffline = false;
+        return;
+      }
+      console.log(`[XingNengGas] 本地数据已超出读取周期（已过 ${elapsedMin} 分钟，设定间隔: ${intervalMin} 分钟），正在联网拉取最新数据...`);
+    }
+
+    try {
+      // 使用兴能燃气加密链路: serverKey 协商 -> AES/RSA 加密请求 -> 解密响应
+      const result = await queryBalance(token, consNo);
+      if (!result || result.balance === null) {
+        throw new Error('接口返回异常状态');
+      }
+      this.gasData = {
+        countMoney: result.balance,
+        newCountMoney: result.balance,
+        oweMoney: result.arrears,
+        custCode: result.consNo,
+        custName: result.consName,
+        compName: result.companyName || this.settings.customCompName || '成都市双流区兴能天然气有限责任公司',
+        gasPropName: result.gasPropName,
+        gasAddress: result.gasAddress,
+        lastRecord: result.lastRecord,
+        lastRecordTime: result.lastRecordTime,
+      };
+      const comp = this.settings.customCompName || result.companyName || this.detectCompanyName(this.gasData) || '成都市双流区兴能天然气有限责任公司';
+      this.gasData.compName = comp;
+
+      // token 自动提取: 户名 / 服务单位 / 微信用户ID
+      // 仅在用户未手动配置或已有配置为明显非法值(如被误解析的代码片段)时回填
+      const isBadName = (v) => !v || /[=;{}()]/.test(v) || !/^[\u4e00-\u9fa5A-Za-z*·\s]{2,20}$/.test(v);
+      const isBadComp = (v) => !v || /[=;{}]/.test(v) || !/^[\u4e00-\u9fa5A-Za-z0-9（）()]{4,40}$/.test(v);
+      let settingsChanged = false;
+      if (result.consName && isBadName(this.settings.custName)) {
+        this.settings.custName = result.consName;
+        settingsChanged = true;
+      }
+      if (result.companyName && isBadComp(this.settings.customCompName)) {
+        this.settings.customCompName = result.companyName;
+        settingsChanged = true;
+      }
+      if (result.wechatUserId && (isBadName(this.settings.userId) || /^o[A-Za-z0-9_-]{15,40}$/.test(result.wechatUserId))) {
+        this.settings.userId = result.wechatUserId;
+        settingsChanged = true;
+      }
+      if (settingsChanged) {
+        this.saveSettings(false);
+        console.log(`[XingNengGas] 已自动提取并保存: 户名=${this.settings.custName}, 服务单位=${this.settings.customCompName}, 微信用户ID=${this.settings.userId}`);
+      }
+
+      const dateObj = new Date();
+      this.gasData._fetchTime = dateObj.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+      this.gasData._fetchDate = dateObj.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+      this.gasData._updateTimestamp = Date.now();
+
+      this.saveCache(cacheKey, JSON.stringify(this.gasData));
+      this.isOffline = false;
+      console.log(`[XingNengGas] 成功获取最新燃气数据并写入沙盒，余额: ${this.gasData.countMoney}，更新时间: ${this.gasData._fetchTime}`);
+    } catch (e) {
+      console.warn('[XingNengGas] 联网请求失败或 token 异常，安全回退本地缓存: ' + e);
+      if (cachedData) {
+        this.gasData = cachedData;
+        this.isOffline = true;
+      } else {
+        this.gasData = null;
+      }
+    }
+  }
+
+  async parseClipboardCurl() {
+    const paste = Pasteboard.paste();
+    if (!paste || !paste.trim()) {
+      const a = new Alert();
+      a.title = '剪贴板为空';
+      a.message = '请先在 Surge / Loon 抓包软件中复制请求 cURL 或请求头，再点击此功能。';
+      a.addAction('知道了');
+      await a.presentAlert();
+      return;
+    }
+
+    const str = paste.trim();
+    let modified = false;
+
+    // 统一的值有效性检测: 拦截代码片段/字面量, 但放行真实数据
+    const isJunkValue = (v) => {
+      if (!v) return true;
+      if (v.length < 2 || v.length > 60) return true;
+      if (/^(null|undefined|true|false|NaN)$/i.test(v)) return true;
+      if (/[=;{}()<>\[\]]/.test(v)) return true;                 // 含代码符号
+      if (/^[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*/.test(v)) return true; // 变量访问模式 b.userName
+      if (/^[\w$]+\(/.test(v)) return true;                       // 函数调用 foo(
+      return false;
+    };
+
+    // 兴能燃气: 登录凭据为 JWT token (请求头 token 字段)
+    const tokenMatch = str.match(/token['":\s=]+([A-Za-z0-9._\-]{20,})/i) || str.match(/\beyJ[A-Za-z0-9._\-]{20,}\.[A-Za-z0-9._\-]{20,}\.[A-Za-z0-9._\-]{10,}\b/);
+    if (tokenMatch && tokenMatch[1]) {
+      this.settings.xMasAppInfo = tokenMatch[1].trim();
+      modified = true;
+    }
+
+    const custMatch = str.match(/(?:consNo|consno|custCode|custcode)['":\s=]+([0-9]{6,12})/i);
+    if (custMatch && custMatch[1]) {
+      this.settings.custCode = custMatch[1].trim();
+      modified = true;
+    }
+
+    // 户名: 提取真实姓名 (含中文/字母/星号脱敏), 拦截代码片段
+    const nameRegex = /(?:consName|consname|custName|custname)['":\s=]+([^'"&\r\n\s]+)/gi;
+    let nMatch;
+    while ((nMatch = nameRegex.exec(str)) !== null) {
+      let rawName = nMatch[1].trim();
+      try { rawName = decodeURIComponent(rawName); } catch (_) {}
+      rawName = rawName.replace(/['"]+$/, '');
+      if (!isJunkValue(rawName) && !/^\d+$/.test(rawName)) {
+        this.settings.custName = rawName;
+        modified = true;
+        break;
+      }
+    }
+
+    // 服务单位: 提取真实公司名 (必须含中文), 拦截代码片段
+    const compMatch = str.match(/(?:compName|companyName|company|corpName)['":\s=]+([^'"&\r\n]+)/i);
+    if (compMatch && compMatch[1]) {
+      let rawComp = compMatch[1].trim();
+      try { rawComp = decodeURIComponent(rawComp); } catch (_) {}
+      rawComp = rawComp.replace(/['"]+$/, '');
+      if (!isJunkValue(rawComp) && /[\u4e00-\u9fa5]/.test(rawComp)) {
+        this.settings.customCompName = rawComp;
+        modified = true;
+      }
+    }
+
+    const a = new Alert();
+    if (modified) {
+      this.saveSettings(false);
+      await this.fetchGasInfo(true);
+      const d = this.gasData || {};
+      a.title = '凭据解析成功';
+      a.message = `已自动提取并保存：\n• 燃气户号: ${this.settings.custCode || '未找到'}\n• 户名: ${d.custName || this.settings.custName || '接口自动获取'}\n• 登录凭据: 已更新\n• 服务单位: ${d.compName || this.settings.customCompName || '接口自动获取'}`;
+    } else {
+      a.title = '未识别到兴能燃气请求参数';
+      a.message = '未能从剪贴板解析出有效凭据，请确认复制的是 wx.shuangliu.qjcode.com 的请求。';
+    }
+    a.addAction('确定');
+    await a.presentAlert();
+    this.reopenScript();
+  }
+
+  formatMoney(num) {
+    const val = parseFloat(num);
+    return isNaN(val) ? '0.00' : val.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  detectCompanyName(obj) {
+    if (!obj || typeof obj !== 'object') return '';
+    try {
+      for (const [k, v] of Object.entries(obj)) {
+        if (typeof v === 'string' && (v.includes('燃气') || v.includes('兴能') || v.includes('公司')) && !v.includes('http') && v.length < 50) {
+          return v.trim();
+        }
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  formatCustCode(code, isShort = false) {
+    if (!code) return '--';
+    if (this.settings.maskCustCode === 'true') {
+      if (code.length >= 8) {
+        return code.slice(0, 3) + '****' + code.slice(-2);
+      }
+      return '****' + code.slice(-2);
+    }
+    if (isShort) {
+      return code.length > 5 ? code.slice(-5) : code;
+    }
+    return code;
+  }
+
+  formatCompName(name, isFull = false) {
+    const raw = (name || (this.gasData && this.gasData.compName) || this.settings.customCompName || '').trim();
+    if (this.settings.maskCompName === 'true') {
+      return '兴能燃气';
+    }
+    if (!raw || raw === 'undefined' || raw === 'null') {
+      return '兴能燃气';
+    }
+    if (isFull) {
+      return raw;
+    }
+    return raw.replace(/城市燃气发展有限公司|燃气发展有限公司|有限责任公司|有限公司/g, '');
+  }
+
+  /**
+   * 计算当前余额占基准的比例
+   */
+  getBalanceRatio() {
+    const d = this.gasData || {};
+    const isOwe = d.oweMoney && parseFloat(d.oweMoney) > 0;
+    if (isOwe) return 0;
+    const bal = parseFloat(d.countMoney || d.newCountMoney || '0');
+    if (isNaN(bal) || bal <= 0) return 0;
+    const maxLimit = parseFloat(this.settings.balanceLimit) || 500;
+    return Math.max(0, Math.min(1.0, bal / maxLimit));
+  }
+
+  /**
+   * 动态计算胶囊点亮格数（以预设满额为基准）
+   */
+  getCapsuleActiveCount(totalSegments = 10) {
+    const d = this.gasData || {};
+    const isOwe = d.oweMoney && parseFloat(d.oweMoney) > 0;
+    if (isOwe) {
+      return 1;
+    }
+    const ratio = this.getBalanceRatio();
+    if (ratio <= 0) return 0;
+    return Math.max(1, Math.round(ratio * totalSegments));
+  }
+
+  /**
+   * 动态色阶渐变算法（绿 -> 青 -> 黄 -> 橙 -> 红 5 大色阶）
+   */
+  getBarColors(ratio, isOwe) {
+    if (this.settings.useGradientBar === 'false') {
+      const single = this.settings.themeColor || '#FF9500';
+      return { start: single, end: single };
+    }
+
+    if (isOwe) {
+      return { start: '#EF4444', end: '#DC2626' };
+    }
+
+    if (ratio >= 0.8) {
+      return { start: '#10B981', end: '#34D399' };
+    } else if (ratio >= 0.6) {
+      return { start: '#06B6D4', end: '#22D3EE' };
+    } else if (ratio >= 0.4) {
+      return { start: '#EAB308', end: '#FACC15' };
+    } else if (ratio >= 0.2) {
+      return { start: '#F97316', end: '#FB923C' };
+    } else {
+      return { start: '#EF4444', end: '#F87171' };
+    }
+  }
+
+  /**
+   * 颜色平滑线性插值
+   */
+  interpolateColor(color1Hex, color2Hex, factor) {
+    try {
+      const c1 = parseInt(color1Hex.replace('#', ''), 16);
+      const c2 = parseInt(color2Hex.replace('#', ''), 16);
+      const r1 = (c1 >> 16) & 255, g1 = (c1 >> 8) & 255, b1 = c1 & 255;
+      const r2 = (c2 >> 16) & 255, g2 = (c2 >> 8) & 255, b2 = c2 & 255;
+      const r = Math.round(r1 + (r2 - r1) * factor);
+      const g = Math.round(g1 + (g2 - g1) * factor);
+      const b = Math.round(b1 + (b2 - b1) * factor);
+      return new Color('#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1));
+    } catch (_) {
+      return new Color(color1Hex);
+    }
+  }
+
+  /**
+   * 绘制科技感胶囊进度条（支持多色阶渐变与平滑单元插值）
+   */
+  drawCapsuleBar(width, height, totalSegments = 10, activeSegments = 7, colors) {
+    const dc = new DrawContext();
+    dc.size = new Size(width, height);
+    dc.opaque = false;
+    dc.respectScreenScale = true;
+
+    const gap = 3.5;
+    const segWidth = (width - gap * (totalSegments - 1)) / totalSegments;
+    const corner = height / 2;
+
+    const bgCol = Color.dynamic(new Color('#E5E7EB'), new Color('#374151'));
+
+    const startHex = (colors && colors.start) || '#FF9500';
+    const endHex = (colors && colors.end) || startHex;
+
+    for (let i = 0; i < totalSegments; i++) {
+      const x = i * (segWidth + gap);
+      const path = new Path();
+      path.addRoundedRect(new Rect(x, 0, segWidth, height), corner, corner);
+      dc.addPath(path);
+
+      if (i < activeSegments) {
+        const factor = activeSegments > 1 ? (i / (activeSegments - 1)) : 0;
+        dc.setFillColor(this.interpolateColor(startHex, endHex, factor));
+      } else {
+        dc.setFillColor(bgCol);
+      }
+      dc.fillPath();
+    }
+
+    return dc.getImage();
+  }
+
+  async render() {
+    await this.init();
+    const widget = new ListWidget();
+    await this.getWidgetBackgroundImage(widget);
+    this.widgetColor = this.getColor();
+
+    const intervalMin = parseInt(this.settings.interval) || 360;
+    widget.refreshAfterDate = new Date(Date.now() + 1000 * 60 * intervalMin);
+
+    if (!this.settings.custCode || !this.settings.xMasAppInfo) {
+      return this.renderGuideWidget(widget);
+    }
+
+    if (!this.gasData) {
+      return this.renderErrorWidget(widget);
+    }
+
+    if (this.widgetFamily === 'medium') {
+      return await this.renderMedium(widget);
+    } else if (this.widgetFamily === 'large') {
+      return await this.renderLarge(widget);
+    } else {
+      return await this.renderSmall(widget);
+    }
+  }
+
+  /**
+   * 小尺寸组件 (Small) - 饱满紧凑对齐
+   */
+  async renderSmall(w) {
+    const pX = 14 * this.SCALE;
+    const pY = 12 * this.SCALE;
+    w.setPadding(pY, pX, pY, pX);
+    w.backgroundColor = Color.dynamic(new Color('#FFFFFF'), new Color('#111827'));
+
+    const d = this.gasData || {};
+    const themeColor = new Color(this.settings.themeColor || '#FF9500');
+    const balanceColor = new Color(this.settings.balanceColor || '#10B981');
+    const subColor = Color.dynamic(new Color('#6B7280'), new Color('#9CA3AF'));
+
+    const body = w.addStack();
+    body.layoutVertically();
+
+    const header = body.addStack();
+    header.centerAlignContent();
+
+    const flame = SFSymbol.named('flame.fill');
+    flame.applyHeavyWeight();
+    const icon = header.addImage(flame.image);
+    icon.imageSize = new Size(16 * this.SCALE, 16 * this.SCALE);
+    icon.tintColor = themeColor;
+    header.addSpacer(5);
+
+    const title = header.addText(this.settings.alias || '兴能燃气');
+    title.font = Font.boldSystemFont(13 * this.SCALE);
+    title.textColor = this.widgetColor;
+
+    header.addSpacer();
+
+    const statePill = header.addStack();
+    statePill.centerAlignContent();
+    statePill.backgroundColor = Color.dynamic(new Color('#F3F4F6'), new Color('#1F2937'));
+    statePill.cornerRadius = 6 * this.SCALE;
+    statePill.setPadding(2 * this.SCALE, 6 * this.SCALE, 2 * this.SCALE, 6 * this.SCALE);
+    const stateText = statePill.addText(this.isOffline ? '离线' : '● 正常');
+    stateText.font = Font.semiboldSystemFont(9.5 * this.SCALE);
+    stateText.textColor = this.isOffline ? themeColor : balanceColor;
+
+    body.addSpacer();
+
+    const isOwe = d.oweMoney && parseFloat(d.oweMoney) > 0;
+    const labelRow = body.addStack();
+    labelRow.centerAlignContent();
+    const balLabel = labelRow.addText(isOwe ? '燃气欠费' : '账户余额');
+    balLabel.font = Font.mediumSystemFont(11 * this.SCALE);
+    balLabel.textColor = isOwe ? new Color('#EF4444') : subColor;
+
+    body.addSpacer(2 * this.SCALE);
+
+    const valRow = body.addStack();
+    valRow.centerAlignContent();
+    const valText = valRow.addText(`¥ ${this.formatMoney(d.countMoney || d.newCountMoney || '0.00')}`);
+    valText.font = Font.boldRoundedSystemFont(27 * this.SCALE);
+    valText.textColor = isOwe ? new Color('#EF4444') : balanceColor;
+    valText.lineLimit = 1;
+    valText.minimumScaleFactor = 0.6;
+
+    body.addSpacer(6 * this.SCALE);
+
+    const ratio = this.getBalanceRatio();
+    const activeSegs = this.getCapsuleActiveCount(10);
+    const barColors = this.getBarColors(ratio, isOwe);
+    const capsuleImg = body.addImage(this.drawCapsuleBar(130 * this.SCALE, 5.5 * this.SCALE, 10, activeSegs, barColors));
+    capsuleImg.imageSize = new Size(130 * this.SCALE, 5.5 * this.SCALE);
+
+    body.addSpacer();
+
+    const footerCard = body.addStack();
+    footerCard.layoutVertically();
+    footerCard.backgroundColor = Color.dynamic(new Color('#F8FAFC'), new Color('#161E2E'));
+    footerCard.cornerRadius = 8 * this.SCALE;
+    footerCard.setPadding(6 * this.SCALE, 8 * this.SCALE, 6 * this.SCALE, 8 * this.SCALE);
+
+    const fRow1 = footerCard.addStack();
+    fRow1.centerAlignContent();
+    const gIcon = SFSymbol.named('gauge.badge.plus');
+    const gImg = fRow1.addImage(gIcon.image);
+    gImg.imageSize = new Size(11 * this.SCALE, 11 * this.SCALE);
+    gImg.tintColor = themeColor;
+    fRow1.addSpacer(3);
+
+    const mText = fRow1.addText(`抄表: ${d.lastRecord || '0'} m³`);
+    mText.font = Font.systemFont(9.5 * this.SCALE);
+    mText.textColor = subColor;
+    fRow1.addSpacer();
+
+    const timeText = fRow1.addText(d._fetchTime || '刚刚');
+    timeText.font = Font.systemFont(9.5 * this.SCALE);
+    timeText.textColor = subColor;
+
+    footerCard.addSpacer(3 * this.SCALE);
+
+    const fRow2 = footerCard.addStack();
+    fRow2.centerAlignContent();
+    const idIcon = SFSymbol.named('creditcard');
+    const idImg = fRow2.addImage(idIcon.image);
+    idImg.imageSize = new Size(11 * this.SCALE, 11 * this.SCALE);
+    idImg.tintColor = new Color('#3B82F6');
+    fRow2.addSpacer(3);
+
+    const custCodeText = fRow2.addText(`户号: ${this.formatCustCode(d.custCode, true)}`);
+    custCodeText.font = Font.systemFont(9.5 * this.SCALE);
+    custCodeText.textColor = subColor;
+    fRow2.addSpacer();
+
+    const nameText = fRow2.addText(d.custName || '兴能燃气');
+    nameText.font = Font.systemFont(9.5 * this.SCALE);
+    nameText.textColor = subColor;
+
+    return w;
+  }
+
+  /**
+   * 中尺寸组件 (Medium) - 余额紧挨进度条，基线精准对齐，动态渐变色
+   */
+  async renderMedium(w) {
+    const pX = 16 * this.SCALE;
+    const pY = 12 * this.SCALE;
+    w.setPadding(pY, pX, pY, pX);
+    w.backgroundColor = Color.dynamic(new Color('#FFFFFF'), new Color('#111827'));
+
+    const d = this.gasData || {};
+    const themeColor = new Color(this.settings.themeColor || '#FF9500');
+    const balanceColor = new Color(this.settings.balanceColor || '#10B981');
+    const subColor = Color.dynamic(new Color('#6B7280'), new Color('#9CA3AF'));
+
+    const body = w.addStack();
+    body.layoutHorizontally();
+
+    const left = body.addStack();
+    left.layoutVertically();
+    left.size = new Size(155 * this.SCALE, 0);
+
+    const lHeader = left.addStack();
+    lHeader.centerAlignContent();
+    const flame = SFSymbol.named('flame.fill');
+    flame.applyHeavyWeight();
+    const fImg = lHeader.addImage(flame.image);
+    fImg.imageSize = new Size(16 * this.SCALE, 16 * this.SCALE);
+    fImg.tintColor = themeColor;
+    lHeader.addSpacer(5);
+    const lTitle = lHeader.addText(this.settings.alias || '兴能燃气');
+    lTitle.font = Font.boldSystemFont(13 * this.SCALE);
+    lTitle.textColor = this.widgetColor;
+
+    left.addSpacer();
+
+    const isOwe = d.oweMoney && parseFloat(d.oweMoney) > 0;
+    const balLabel = left.addText(isOwe ? '燃气欠费 (元)' : '可用气费余额 (元)');
+    balLabel.font = Font.mediumSystemFont(11 * this.SCALE);
+    balLabel.textColor = isOwe ? new Color('#EF4444') : subColor;
+
+    left.addSpacer(2 * this.SCALE);
+
+    const valRow = left.addStack();
+    valRow.centerAlignContent();
+    const valText = valRow.addText(`¥ ${this.formatMoney(d.countMoney || d.newCountMoney || '0.00')}`);
+    valText.font = Font.boldRoundedSystemFont(28 * this.SCALE);
+    valText.textColor = isOwe ? new Color('#EF4444') : balanceColor;
+    valText.lineLimit = 1;
+    valText.minimumScaleFactor = 0.6;
+
+    left.addSpacer(7 * this.SCALE);
+
+    const ratio = this.getBalanceRatio();
+    const activeSegs = this.getCapsuleActiveCount(10);
+    const barColors = this.getBarColors(ratio, isOwe);
+    const capsuleImg = left.addImage(this.drawCapsuleBar(148 * this.SCALE, 7 * this.SCALE, 10, activeSegs, barColors));
+    capsuleImg.imageSize = new Size(148 * this.SCALE, 7 * this.SCALE);
+
+    left.addSpacer();
+
+    const stateRow = left.addStack();
+    stateRow.centerAlignContent();
+    const dot = stateRow.addText('● ');
+    dot.font = Font.systemFont(8 * this.SCALE);
+    dot.textColor = isOwe ? new Color('#EF4444') : balanceColor;
+
+    const stateText = stateRow.addText(isOwe ? '账户已欠费 · 请及时充值' : '管网连接正常 · 气压稳定');
+    stateText.font = Font.systemFont(10 * this.SCALE);
+    stateText.textColor = subColor;
+
+    body.addSpacer(12 * this.SCALE);
+
+    const divider = body.addStack();
+    divider.size = new Size(1, 0);
+    divider.backgroundColor = Color.dynamic(new Color('#E5E7EB'), new Color('#1F2937'));
+    body.addSpacer(12 * this.SCALE);
+
+    const right = body.addStack();
+    right.layoutVertically();
+
+    const rTop = right.addStack();
+    rTop.centerAlignContent();
+    const syncSymbol = SFSymbol.named('arrow.triangle.2.circlepath');
+    const syncImg = rTop.addImage(syncSymbol.image);
+    syncImg.imageSize = new Size(10 * this.SCALE, 10 * this.SCALE);
+    syncImg.tintColor = subColor;
+    rTop.addSpacer(3);
+    const syncTime = rTop.addText(d._fetchTime ? `更新时间 ${d._fetchTime}` : '实时同步');
+    syncTime.font = Font.systemFont(10 * this.SCALE);
+    syncTime.textColor = subColor;
+    rTop.addSpacer();
+
+    right.addSpacer();
+
+    this.createTechRow(right, 'person.crop.rectangle', '客户户号', `${d.custName || '--'} (${this.formatCustCode(d.custCode)})`, themeColor, subColor);
+    right.addSpacer();
+
+    this.createTechRow(right, 'speedometer', '上次抄表', `${d.lastRecord || '0'} m³`, new Color('#3B82F6'), subColor);
+    right.addSpacer();
+
+    this.createTechRow(right, 'calendar.badge.clock', '抄表日期', d.lastRecordTime || '近期已抄表', new Color('#8B5CF6'), subColor);
+    right.addSpacer();
+
+    this.createTechRow(right, 'building.2', '服务单位', this.formatCompName(d.compName, false), new Color('#10B981'), subColor);
+
+    return w;
+  }
+
+  createTechRow(parent, iconName, label, valStr, iconCol, subCol) {
+    const row = parent.addStack();
+    row.centerAlignContent();
+
+    const sym = SFSymbol.named(iconName);
+    const img = row.addImage(sym.image);
+    img.imageSize = new Size(13 * this.SCALE, 13 * this.SCALE);
+    img.tintColor = iconCol;
+    row.addSpacer(4);
+
+    const lText = row.addText(label);
+    lText.font = Font.systemFont(10.5 * this.SCALE);
+    lText.textColor = subCol;
+    row.addSpacer(6);
+
+    const vText = row.addText(valStr);
+    vText.font = Font.semiboldSystemFont(11 * this.SCALE);
+    vText.textColor = this.widgetColor;
+    vText.lineLimit = 1;
+    vText.minimumScaleFactor = 0.7;
+    row.addSpacer();
+  }
+
+  /**
+   * 大尺寸组件 (Large) - 颜色同步支持渐变或自定义单色
+   */
+  async renderLarge(w) {
+    const pX = 16 * this.SCALE;
+    const pY = 14 * this.SCALE;
+    w.setPadding(pY, pX, pY, pX);
+    w.backgroundColor = Color.dynamic(new Color('#FFFFFF'), new Color('#111827'));
+
+    const d = this.gasData || {};
+    const themeColor = new Color(this.settings.themeColor || '#FF9500');
+    const balanceColor = new Color(this.settings.balanceColor || '#10B981');
+    const subColor = Color.dynamic(new Color('#6B7280'), new Color('#9CA3AF'));
+
+    const body = w.addStack();
+    body.layoutVertically();
+
+    const header = body.addStack();
+    header.centerAlignContent();
+    const flame = SFSymbol.named('flame.fill');
+    flame.applyHeavyWeight();
+    const fImg = header.addImage(flame.image);
+    fImg.imageSize = new Size(20 * this.SCALE, 20 * this.SCALE);
+    fImg.tintColor = themeColor;
+    header.addSpacer(6);
+
+    const title = header.addText(this.settings.alias || '兴能燃气在线监控');
+    title.font = Font.boldSystemFont(15 * this.SCALE);
+    title.textColor = this.widgetColor;
+    header.addSpacer();
+
+    const tagBadge = header.addStack();
+    tagBadge.centerAlignContent();
+    tagBadge.backgroundColor = Color.dynamic(new Color('#F3F4F6'), new Color('#1F2937'));
+    tagBadge.cornerRadius = 6 * this.SCALE;
+    tagBadge.setPadding(3 * this.SCALE, 8 * this.SCALE, 3 * this.SCALE, 8 * this.SCALE);
+
+    const tag = tagBadge.addText(this.isOffline ? '离线模式' : `更新时间 ${d._fetchTime || '刚刚'}`);
+    tag.font = Font.semiboldSystemFont(10 * this.SCALE);
+    tag.textColor = this.isOffline ? themeColor : balanceColor;
+
+    body.addSpacer();
+
+    const card = body.addStack();
+    card.layoutVertically();
+    card.backgroundColor = Color.dynamic(new Color('#F8FAFC'), new Color('#161E2E'));
+    card.cornerRadius = 14 * this.SCALE;
+    card.setPadding(12 * this.SCALE, 16 * this.SCALE, 12 * this.SCALE, 16 * this.SCALE);
+
+    const isOwe = d.oweMoney && parseFloat(d.oweMoney) > 0;
+    const cLabel = card.addText(isOwe ? '账户欠费总额 (元)' : '当前账户可用气费余额 (元)');
+    cLabel.font = Font.mediumSystemFont(11.5 * this.SCALE);
+    cLabel.textColor = isOwe ? new Color('#EF4444') : subColor;
+
+    card.addSpacer(3 * this.SCALE);
+
+    const cValRow = card.addStack();
+    cValRow.centerAlignContent();
+    const val = cValRow.addText(`¥ ${this.formatMoney(d.countMoney || d.newCountMoney || '0.00')}`);
+    val.font = Font.boldRoundedSystemFont(33 * this.SCALE);
+    val.textColor = isOwe ? new Color('#EF4444') : balanceColor;
+
+    card.addSpacer(7 * this.SCALE);
+
+    const widgetW = this.getWidgetLargeWidth();
+    const contentW = widgetW - 2 * pX;
+    const barW = Math.max(260 * this.SCALE, contentW - 32 * this.SCALE);
+
+    const ratio = this.getBalanceRatio();
+    const activeSegs = this.getCapsuleActiveCount(14);
+    const barColors = this.getBarColors(ratio, isOwe);
+    const capsule = card.addImage(this.drawCapsuleBar(barW, 8 * this.SCALE, 14, activeSegs, barColors));
+    capsule.imageSize = new Size(barW, 8 * this.SCALE);
+
+    body.addSpacer();
+
+    const grid = body.addStack();
+    grid.layoutHorizontally();
+
+    const gap = 8 * this.SCALE;
+    const colW = Math.floor((contentW - 2 * gap) / 3);
+    const colW3 = contentW - 2 * gap - 2 * colW;
+
+    const cardA = grid.addStack();
+    cardA.layoutVertically();
+    cardA.backgroundColor = Color.dynamic(new Color('#F3F4F6'), new Color('#1F2937'));
+    cardA.cornerRadius = 10 * this.SCALE;
+    cardA.setPadding(9 * this.SCALE, 9 * this.SCALE, 9 * this.SCALE, 9 * this.SCALE);
+    cardA.size = new Size(colW, 0);
+
+    const aHead = cardA.addStack();
+    aHead.centerAlignContent();
+    const aIcon = SFSymbol.named('speedometer');
+    const aImg = aHead.addImage(aIcon.image);
+    aImg.imageSize = new Size(12 * this.SCALE, 12 * this.SCALE);
+    aImg.tintColor = new Color('#3B82F6');
+    aHead.addSpacer(3 * this.SCALE);
+    const aTitle = aHead.addText('上次抄表读数');
+    aTitle.font = Font.systemFont(10 * this.SCALE);
+    aTitle.textColor = subColor;
+    aTitle.lineLimit = 1;
+
+    cardA.addSpacer(4 * this.SCALE);
+    const aVal = cardA.addText(`${d.lastRecord || '0'} m³`);
+    aVal.font = Font.boldRoundedSystemFont(16 * this.SCALE);
+    aVal.textColor = this.widgetColor;
+    aVal.lineLimit = 1;
+    aVal.minimumScaleFactor = 0.8;
+
+    grid.addSpacer(gap);
+
+    const cardB = grid.addStack();
+    cardB.layoutVertically();
+    cardB.backgroundColor = Color.dynamic(new Color('#F3F4F6'), new Color('#1F2937'));
+    cardB.cornerRadius = 10 * this.SCALE;
+    cardB.setPadding(9 * this.SCALE, 9 * this.SCALE, 9 * this.SCALE, 9 * this.SCALE);
+    cardB.size = new Size(colW, 0);
+
+    const bHead = cardB.addStack();
+    bHead.centerAlignContent();
+    const bIcon = SFSymbol.named('calendar.badge.clock');
+    const bImg = bHead.addImage(bIcon.image);
+    bImg.imageSize = new Size(12 * this.SCALE, 12 * this.SCALE);
+    bImg.tintColor = new Color('#8B5CF6');
+    bHead.addSpacer(3 * this.SCALE);
+    const bTitle = bHead.addText('抄表核算日期');
+    bTitle.font = Font.systemFont(10 * this.SCALE);
+    bTitle.textColor = subColor;
+    bTitle.lineLimit = 1;
+
+    cardB.addSpacer(4 * this.SCALE);
+    const bVal = cardB.addText(d.lastRecordTime || '近期已核算');
+    bVal.font = Font.boldRoundedSystemFont(13.5 * this.SCALE);
+    bVal.textColor = this.widgetColor;
+    bVal.lineLimit = 1;
+    bVal.minimumScaleFactor = 0.8;
+
+    grid.addSpacer(gap);
+
+    const cardC = grid.addStack();
+    cardC.layoutVertically();
+    cardC.backgroundColor = Color.dynamic(new Color('#F3F4F6'), new Color('#1F2937'));
+    cardC.cornerRadius = 10 * this.SCALE;
+    cardC.setPadding(9 * this.SCALE, 9 * this.SCALE, 9 * this.SCALE, 9 * this.SCALE);
+    cardC.size = new Size(colW3, 0);
+
+    const cHead = cardC.addStack();
+    cHead.centerAlignContent();
+    const cIcon = SFSymbol.named('waveform.path.ecg');
+    const cImg = cHead.addImage(cIcon.image);
+    cImg.imageSize = new Size(12 * this.SCALE, 12 * this.SCALE);
+    const statusCol = isOwe ? new Color('#EF4444') : (this.isOffline ? themeColor : balanceColor);
+    cImg.tintColor = statusCol;
+    cHead.addSpacer(3 * this.SCALE);
+    const cTitle = cHead.addText('管网监控状态');
+    cTitle.font = Font.systemFont(10 * this.SCALE);
+    cTitle.textColor = subColor;
+    cTitle.lineLimit = 1;
+
+    cardC.addSpacer(4 * this.SCALE);
+    const cStatusRow = cardC.addStack();
+    cStatusRow.centerAlignContent();
+    const cDot = cStatusRow.addText('● ');
+    cDot.font = Font.systemFont(7 * this.SCALE);
+    cDot.textColor = statusCol;
+
+    const cValText = isOwe ? '账户欠费' : (this.isOffline ? '离线保持' : '气压稳定');
+    const cVal = cStatusRow.addText(cValText);
+    cVal.font = Font.boldSystemFont(12 * this.SCALE);
+    cVal.textColor = this.widgetColor;
+    cVal.lineLimit = 1;
+    cVal.minimumScaleFactor = 0.8;
+
+    body.addSpacer();
+
+    const listCard = body.addStack();
+    listCard.layoutVertically();
+    listCard.backgroundColor = Color.dynamic(new Color('#F8FAFC'), new Color('#161E2E'));
+    listCard.cornerRadius = 10 * this.SCALE;
+    listCard.setPadding(10 * this.SCALE, 14 * this.SCALE, 10 * this.SCALE, 14 * this.SCALE);
+
+    this.createTechRow(listCard, 'person.crop.rectangle', '客户姓名', d.custName || '--', themeColor, subColor);
+    listCard.addSpacer(6 * this.SCALE);
+    this.createTechRow(listCard, 'number', '燃气户号', this.formatCustCode(d.custCode), themeColor, subColor);
+    listCard.addSpacer(6 * this.SCALE);
+    this.createTechRow(listCard, 'building.2', '服务单位', this.formatCompName(d.compName, true), new Color('#10B981'), subColor);
+    listCard.addSpacer(6 * this.SCALE);
+    this.createTechRow(listCard, 'phone.badge.waveform', '客服热线', '028-85860568', new Color('#F59E0B'), subColor);
+
+    return w;
+  }
+
+  renderGuideWidget(w) {
+    w.setPadding(16, 16, 16, 16);
+    w.backgroundColor = Color.dynamic(new Color('#FFFFFF'), new Color('#111827'));
+    const center = w.addStack();
+    center.layoutVertically();
+    center.centerAlignContent();
+
+    const title = center.addText('China Gas');
+    title.font = Font.boldSystemFont(15);
+    title.textColor = new Color('#FF9500');
+
+    center.addSpacer(8);
+
+    const tip = center.addText('未检测到凭证配置');
+    tip.font = Font.boldSystemFont(12);
+    tip.textColor = this.widgetColor;
+
+    center.addSpacer(4);
+
+    const desc = center.addText('请点击打开组件，在【账户设置】中输入参数或使用剪贴板智能解析。');
+    desc.font = Font.systemFont(11);
+    desc.textColor = new Color('#9CA3AF');
+    desc.centerAlignText();
+
+    return w;
+  }
+
+  renderErrorWidget(w) {
+    w.setPadding(16, 16, 16, 16);
+    w.backgroundColor = Color.dynamic(new Color('#FFFFFF'), new Color('#111827'));
+    const center = w.addStack();
+    center.layoutVertically();
+    center.centerAlignContent();
+
+    const title = center.addText('数据连接失败');
+    title.font = Font.boldSystemFont(14);
+    title.textColor = new Color('#EF4444');
+
+    center.addSpacer(6);
+
+    const msg = center.addText('网络超时且无离线缓存，请检查网络或重新配置凭证。');
+    msg.font = Font.systemFont(11);
+    msg.textColor = new Color('#9CA3AF');
+    msg.centerAlignText();
+
+    return w;
+  }
+
+  async promptInput(title, desc, key, placeholder) {
+    const a = new Alert();
+    a.title = String(title || '');
+    a.message = String(desc || '');
+    const cur = String(this.settings[key] || '');
+    a.addTextField(String(placeholder || ''), cur);
+    a.addAction('确定');
+    a.addCancelAction('取消');
+    const res = await a.presentAlert();
+    if (res === 0) {
+      this.settings[key] = String(a.textFieldValue(0) || '').trim();
+      this.saveSettings(false);
+    }
+  }
+
+  async showHelpGuide() {
+    const a = new Alert();
+    a.title = '兴能燃气抓包指引';
+    a.message = [
+      '1. 开启手机抓包软件 (Surge / Loon / Quantumult X)；',
+      '2. 打开微信进入【兴能燃气】小程序并点击查询或我的；',
+      '3. 筛选主机包含 wx.shuangliu.qjcode.com 的请求；',
+      '4. 复制该请求的 cURL 或请求头（需含 token 请求头）；',
+      '5. 返回此处点击【剪贴板一键智能解析】即可全自动填入。'
+    ].join('\n\n');
+    a.addAction('我知道了');
+    await a.presentAlert();
+  }
+
+  setAccountConfig = async () => {
+    return this.renderAppView([
+      {
+        title: '账户凭证与抓包配置',
+        menu: [
+          {
+            icon: { name: 'questionmark.circle', color: '#3B82F6' },
+            type: 'input',
+            name: 'help_guide',
+            val: 'help_guide',
+            title: '抓包指引与帮助',
+            desc: '查看如何抓包获取兴能燃气凭证',
+            onClick: async () => {
+              await this.showHelpGuide();
+            }
+          },
+          {
+            icon: { name: 'doc.on.clipboard', color: '#10B981' },
+            type: 'input',
+            name: 'parse_clipboard',
+            val: 'parse_clipboard',
+            title: '剪贴板一键智能解析',
+            desc: '复制抓包后点击自动提取所有参数',
+            onClick: async () => {
+              await this.parseClipboardCurl();
+            }
+          },
+          {
+            icon: { name: 'message.fill', color: '#07C160' },
+            type: 'input',
+            name: 'open_wechat',
+            val: 'open_wechat',
+            title: '快捷打开微信',
+            desc: '跳转微信打开兴能燃气小程序',
+            onClick: () => {
+              Safari.open('weixin://');
+            }
+          },
+          {
+            icon: { name: 'number', color: '#F59E0B' },
+            type: 'input',
+            title: '燃气户号 (custCode)',
+            desc: this.settings.custCode ? `当前: ${this.settings.custCode}` : '未配置 (点击输入)',
+            val: 'custCode',
+            onClick: async () => {
+              await this.promptInput('燃气户号', '请输入 9 位燃气客户编号 (如 636550678)', 'custCode', '636550678');
+              this.reopenScript();
+            }
+          },
+          {
+            icon: { name: 'person.crop.rectangle', color: '#8B5CF6' },
+            type: 'input',
+            title: '客户姓名 (custName)',
+            desc: this.settings.custName ? `当前: ${this.settings.custName}` : '未配置 (点击输入)',
+            val: 'custName',
+            onClick: async () => {
+              await this.promptInput('客户姓名', '请输入客户姓名 (如 董鑫周)', 'custName', '董鑫周');
+              this.reopenScript();
+            }
+          },
+          {
+            icon: { name: 'person.fill', color: '#06B6D4' },
+            type: 'input',
+            title: '微信用户 ID (userId)',
+            desc: '兴能燃气无需 userId，可留空',
+            val: 'userId',
+            onClick: async () => {
+              await this.promptInput('User ID', '兴能燃气无需 userId，直接留空即可', 'userId', '');
+              this.reopenScript();
+            }
+          },
+          {
+            icon: { name: 'building.2.fill', color: '#10B981' },
+            type: 'input',
+            title: '服务单位 (compName)',
+            desc: this.settings.customCompName ? `当前: ${this.settings.customCompName}` : '默认: 成都市双流区兴能天然气有限责任公司 (点击修改)',
+            val: 'customCompName',
+            onClick: async () => {
+              await this.promptInput('服务单位', '请输入实际所属服务单位 (如：成都市双流区兴能天然气有限责任公司)', 'customCompName', '成都市双流区兴能天然气有限责任公司');
+              this.reopenScript();
+            }
+          },
+          {
+            icon: { name: 'key.fill', color: '#EC4899' },
+            type: 'input',
+            title: '登录凭证 (token)',
+            desc: this.settings.xMasAppInfo ? '已配置 (点击修改)' : '未配置 (点击输入)',
+            val: 'xMasAppInfo',
+            onClick: async () => {
+              await this.promptInput('token 凭据', '请粘贴抓包中的完整 JWT token (eyJ... 开头)', 'xMasAppInfo', 'eyJhbGciOi...');
+              this.reopenScript();
+            }
+          },
+          {
+            icon: { name: 'tag.fill', color: '#F97316' },
+            type: 'input',
+            title: '组件别名',
+            desc: this.settings.alias || '兴能燃气',
+            val: 'alias',
+            onClick: async () => {
+              await this.promptInput('组件别名', '如：我家燃气、父母家、店面', 'alias', '我家燃气');
+              this.reopenScript();
+            }
+          }
+        ]
+      }
+    ]);
+  };
+
+  setShowConfig = async () => {
+    return this.renderAppView([
+      {
+        title: '显示设置',
+        menu: [
+          {
+            icon: { name: 'slider.horizontal.3', color: '#FF9500' },
+            type: 'switch',
+            title: '进度条余额渐变色',
+            desc: '根据余额多少动态变换绿-青-黄-橙-红5大色阶',
+            val: 'useGradientBar',
+            default: true,
+          },
+          {
+            icon: { name: 'paintpalette.fill', color: '#F59E0B' },
+            type: 'color',
+            title: '自定义品牌强调色(单色)',
+            desc: '关闭渐变色时生效，进度条采用此单色',
+            defaultValue: '#FF9500',
+            val: 'themeColor',
+          },
+          {
+            icon: { name: 'number.square.fill', color: '#3B82F6' },
+            type: 'switch',
+            title: '隐藏户号脱敏 (512****03)',
+            val: 'maskCustCode',
+          },
+          {
+            icon: { name: 'building.2', color: '#10B981' },
+            type: 'switch',
+            title: '隐藏服务单位脱敏 (中国燃气)',
+            val: 'maskCompName',
+          },
+          {
+            icon: { name: 'speedometer', color: '#8B5CF6' },
+            type: 'input',
+            placeholder: '500',
+            title: '满额基准额度 (元)',
+            desc: '进度条 100% 对应的金额基准，默认500元',
+            val: 'balanceLimit',
+          },
+          {
+            icon: { name: 'flame.fill', color: '#10B981' },
+            type: 'color',
+            title: '余额充沛主题色',
+            defaultValue: '#10B981',
+            val: 'balanceColor',
+          },
+          {
+            icon: { name: 'arrow.counterclockwise', color: '#EF4444' },
+            title: '重置默认状态',
+            desc: '恢复显示配置、色阶渐变与额度为出厂默认值',
+            val: 'reset_show_config',
+            name: 'reset_show_config',
+            onClick: async () => {
+              const alert = new Alert();
+              alert.title = '重置显示配置';
+              alert.message = '确定将所有显示配置（渐变色、脱敏、主题色、满额基准等）恢复为初始默认值吗？';
+              alert.addAction('确认重置');
+              alert.addCancelAction('取消');
+              const res = await alert.presentAlert();
+              if (res === 0) {
+                this.settings.useGradientBar = 'true';
+                this.settings.themeColor = '#FF9500';
+                this.settings.balanceColor = '#10B981';
+                this.settings.maskCustCode = 'false';
+                this.settings.maskCompName = 'false';
+                this.settings.balanceLimit = '500';
+                this.saveSettings(false);
+                const s = new Alert();
+                s.title = '重置成功';
+                s.message = '显示配置已恢复为默认状态！';
+                s.addAction('确定');
+                await s.presentAlert();
+                this.reopenScript();
+              }
+            }
+          }
+        ]
+      }
+    ]);
+  };
+
+  isNewerVersion(v1, v2) {
+    if (!v1 || !v2) return false;
+    const p1 = String(v1).split('.').map(Number);
+    const p2 = String(v2).split('.').map(Number);
+    for (let i = 0; i < Math.max(p1.length, p2.length); i++) {
+      const num1 = p1[i] || 0;
+      const num2 = p2[i] || 0;
+      if (num1 > num2) return true;
+      if (num1 < num2) return false;
+    }
+    return false;
+  }
+
+  async checkAndUpdateScript() {
+    // 兴能燃气为本地定制版，不提供在线更新源
+    const alert = new Alert();
+    alert.title = '不支持在线更新';
+    alert.message = '本脚本为兴能燃气定制版（基于 ChinaGas v1.8.3 改造），未托管远程更新源，请保留本地文件。\n\n如需更新，请直接替换两个文件：XingNengGas.js 与 DmYY.js（须放在同一目录）。';
+    alert.addAction('知道了');
+    await alert.presentAlert();
+    this.settings.lastUpdateCheckTime = Date.now();
+    this.saveSettings(false);
     return;
   }
-  try {
-    const data = await queryBalance();
-    writeCache(data);
-    Script.setWidget(makeWidget({ data, updatedAt: data.updatedAt, stale: false }, family));
-    Script.complete();
-  } catch (e) {
-    if (cached) {
-      Script.setWidget(makeWidget({ data: cached, updatedAt: cached.updatedAt, stale: true }, family));
-    } else {
-      Script.setWidget(renderErrorWidget(new ListWidget(), e.message || String(e)));
+
+  Run() {
+    if (config.runsInApp) {
+      this.registerAction({
+        title: '组件配置',
+        menu: [
+          {
+            icon: { name: 'arrow.triangle.2.circlepath', color: '#10B981' },
+            type: 'input',
+            title: '脚本更新',
+            desc: '检测 GitHub 官方仓库最新版本',
+            name: 'update',
+            val: 'update',
+            onClick: async () => {
+              await this.checkAndUpdateScript();
+            },
+          },
+          {
+            icon: { name: 'clock.arrow.2.circlepath', color: '#3B82F6' },
+            type: 'input',
+            placeholder: '360',
+            title: '刷新时间',
+            desc: '数据刷新时间，单位：分钟，默认360分钟',
+            val: 'interval',
+          },
+          {
+            icon: { name: 'arrow.clockwise', color: '#FF9500' },
+            name: 'force_refresh',
+            title: '立即刷新',
+            desc: '强制跳过缓存间隔，立即向兴能燃气拉取最新数据',
+            val: 'force_refresh',
+            onClick: async () => {
+              await this.fetchGasInfo(true);
+              const s = new Alert();
+              s.title = this.isOffline ? '获取异常' : '刷新成功';
+              s.message = this.isOffline ? '在线拉取未成功，已继续保留使用沙盒离线数据。' : `已拉取最新数据！当前余额: ¥ ${this.formatMoney(this.gasData.countMoney)}`;
+              s.addAction('确定');
+              await s.presentAlert();
+              this.reopenScript();
+            }
+          },
+          {
+            icon: { name: 'trash', color: '#EF4444' },
+            name: 'reset_cache',
+            title: '清除缓存',
+            desc: '清空本地所有历史缓存数据',
+            val: 'reset_cache',
+            onClick: async () => {
+              const alert = new Alert();
+              alert.title = '清除缓存';
+              alert.message = '将清空本地所有燃气历史缓存数据。确定清除吗？';
+              alert.addAction('确认清除');
+              alert.addCancelAction('取消');
+              const res = await alert.presentAlert();
+              if (res === 0) {
+                this.clearStorage();
+                const s = new Alert();
+                s.title = '清除成功';
+                s.message = '缓存已清空，请重新进入或刷新拉取！';
+                s.addAction('确定');
+                await s.presentAlert();
+                this.reopenScript();
+              }
+            }
+          },
+        ]
+      });
+
+      this.registerAction({
+        title: '',
+        menu: [
+          {
+            icon: { name: 'person.crop.circle', color: '#3B82F6' },
+            name: 'account',
+            title: '账户设置',
+            type: 'input',
+            onClick: () => {
+              return this.setAccountConfig();
+            }
+          },
+          {
+            icon: { name: 'slider.horizontal.3', color: '#8B5CF6' },
+            name: 'show',
+            title: '显示配置',
+            type: 'input',
+            onClick: () => {
+              return this.setShowConfig();
+            }
+          }
+        ]
+      });
+
+      this.registerAction({
+        title: '',
+        menu: [
+          {
+            icon: { name: 'gearshape.fill', color: '#096dd9' },
+            name: 'basic',
+            title: '基础设置',
+            type: 'input',
+            onClick: () => {
+              return this.setWidgetConfig();
+            }
+          },
+          {
+            icon: { name: 'arrow.triangle.2.circlepath.circle.fill', color: '#10B981' },
+            name: 'reload',
+            title: '重载组件',
+            type: 'input',
+            onClick: () => {
+              this.reopenScript();
+            }
+          }
+        ]
+      });
     }
-    Script.complete();
   }
-}
-async function runApp() {
-  const a = new Alert();
-  a.title = '兴能燃气 · 小组件';
-  const saved = readTokenCfg();
-  a.message = saved ? 'Token 已配置 ✓\n选择要执行的操作。' : '需要先填写 Token 才能查询余额。';
-  a.addAction('填写 Token');
-  a.addAction('立即刷新并预览');
-  a.addAction('预览中号');
-  a.addAction('预览小号');
-  a.addAction('预览大号');
-  a.addCancelAction('取消');
-  const i = await a.presentSheet();
-  if (i === 0) {
-    const b = new Alert();
-    b.title = '填写 Token';
-    b.message = '粘贴 Quantumult X 抓包得到的 token (JWT)。会保存到 iPhone 钥匙串。';
-    b.addTextField('token');
-    b.addAction('保存');
-    b.addCancelAction('取消');
-    if (await b.presentAlert() === -1) return;
-    const t = b.textFieldValue(0).trim();
-    if (!t) { await notice('未保存', 'Token 为空。'); return; }
-    try {
-      Keychain.set(KEYCHAIN.TOKEN, t);
-      await notice('已保存', 'Token 已写入钥匙串。');
-    } catch (_) { await notice('保存失败', '钥匙串不可用，请直接编辑脚本顶部 CONFIG.TOKEN。'); }
-  } else if (i === 1 || i === 2 || i === 3 || i === 4) {
-    const family = i === 3 ? 'small' : (i === 4 ? 'large' : 'medium');
-    try {
-      const data = await queryBalance();
-      writeCache(data);
-      const w = makeWidget({ data, updatedAt: data.updatedAt, stale: false }, family);
-      if (family === 'small') await w.presentSmall();
-      else if (family === 'large') await w.presentLarge();
-      else await w.presentMedium();
-    } catch (e) {
-      await notice('查询失败', e.message || String(e));
-    }
-  }
-}
-async function notice(title, body) {
-  const a = new Alert();
-  a.title = title;
-  a.message = body;
-  a.addAction('知道了');
-  await a.presentAlert();
 }
 
-// ================= 入口 =================
-if (config.runsInWidget) {
-  await runWidget();
-} else {
-  await runApp();
-}
-Script.complete();
+await Runing(Widget, args.widgetParameter, false);
