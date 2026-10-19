@@ -2,10 +2,10 @@
 // These must be at the very top of the file. Do not edit.
 // icon-color: deep orange; icon-glyph: flame.fill;
 // ============================================================
-// gas-widget.js — 成都双流兴能天然气 余额小组件 (Scriptable)
-// 单文件 · 零依赖 · 不需要服务器/后端
+// 兴能燃气余额小组件 (Scriptable) — 参考 ChinaGas v1.8.3 UI
+// 单文件 · 零依赖 · 不需要服务器
 // 内置: 纯JS RSA-1024 (PKCS1 v1.5) + AES-128-ECB/Pkcs7 加密
-// 数据: /api/sec/serverKey 协商 + /api/micro/bill/arrearage 余额
+// 数据: /api/sec/serverKey 协商 + /api/micro/bill/arrearage + accountInfo
 // 用法: 存到 Scriptable -> 首次运行填 TOKEN -> 添加桌面小组件
 // ============================================================
 
@@ -140,7 +140,7 @@ function gfPow(base, exp) {
   }
   return r;
 }
-function gfInv(a) { return gfPow(a, 254); } // a^(2^8-2) = a^-1 in GF(2^8)
+function gfInv(a) { return gfPow(a, 254); }
 function affine(inv) {
   let res = 0;
   for (let i = 0; i < 8; i++) {
@@ -266,7 +266,6 @@ function rsaPrivateDecrypt(cipherBytes, n, d) {
   if (i >= k) throw new Error('RSA无分隔符');
   return em.subarray(i + 1);
 }
-// 解析服务端 RSA 公钥 (SPKI DER base64) -> {n, e}
 function parseSpkiPub(b64) {
   const der = b64decode(b64);
   const readLen = (p) => {
@@ -318,32 +317,27 @@ async function postJson(urlPath, bodyObj, headers) {
 async function callEncrypted(path, payload) {
   const token = getToken();
   const commonHdrs = { token, fromDomainId: CONFIG.FROM_DOMAIN_ID, part: 'WECHAT' };
-  // 1. serverKey 协商
   const sk = await postJson('/api/sec/serverKey', { key: CLIENT_KEY.PUB_SPKI_B64, data: '' }, commonHdrs);
   if (!sk || !sk.obj) throw new Error('协商失败');
   const secret = sk.obj.key;
   const serverPub = parseSpkiPub(sk.obj.data);
-  // 2. 加密请求体
   const aesKeyStr = genAesKey();
   const aesKeyBytes = strToBytes(aesKeyStr);
   const encData = aes128EcbEncrypt(pkcs7Pad(strToBytes(JSON.stringify(payload))), aesKeyBytes);
   const encKey = rsaPublicEncrypt(strToBytes(aesKeyStr), serverPub.n, serverPub.e);
-  // 3. 调用
   const resp = await postJson(path, { key: b64encode(encKey), data: b64encode(encData) }, Object.assign({ secret }, commonHdrs));
   if (!resp || !resp.key || !resp.data) throw new Error('接口失败: ' + JSON.stringify(resp).slice(0, 200));
-  // 4. 解密
   const aesKey2 = rsaPrivateDecrypt(b64decode(resp.key), b64urlToBigInt(CLIENT_KEY.N), b64urlToBigInt(CLIENT_KEY.D));
   const plain = JSON.parse(bytesToStr(pkcs7Unpad(aes128EcbDecrypt(b64decode(resp.data), aesKey2))));
   if (plain.success === false) throw new Error(plain.msg || '接口返回失败');
   return plain;
 }
-// 主查询: arrearage(余额/欠费/上期余额) + accountInfo(户名/卡号/气种)
 async function queryBalance() {
   const ar = await callEncrypted('/api/micro/bill/arrearage', { consNo: CONFIG.CONSNO });
   const ac = await callEncrypted('/api/micro/bill/accountInfo', { consNo: CONFIG.CONSNO });
   const a = ar.obj || {}, b = ac.obj || {};
   return {
-    balance: a.balance ?? b.presBalance ?? '—',
+    balance: a.balance ?? b.presBalance ?? null,
     arrears: a.amt ?? a.allFee ?? null,
     lastBalance: a.lastBalance ?? null,
     consNo: b.consNo || a.consNo || CONFIG.CONSNO,
@@ -355,222 +349,539 @@ async function queryBalance() {
   };
 }
 
-// ================= 小组件 UI (参考港华燃气组件风格) =================
-const tone = (light, dark) => Color.dynamic(new Color(light), new Color(dark));
-const C = {
-  bg: tone('#FFF9F3', '#211C19'), bgEnd: tone('#F6EEE5', '#171513'),
-  text: tone('#33251E', '#F8EDE4'), muted: tone('#796352', '#C4B2A4'),
-  accent: tone('#B75022', '#FFB581'), panel: tone('#F3E7DA', '#33291F'),
-  iconBg: tone('#F9DFC9', '#4B3022'), alert: tone('#A12D25', '#FFAA99'),
-  ok: tone('#1F7A4D', '#7FD9A8'),
+// ================= UI (参考 ChinaGas v1.8.3) =================
+const UI_SETTINGS = {
+  alias: '兴能燃气',
+  themeColor: '#FF9500',
+  balanceColor: '#10B981',
+  balanceLimit: 500,     // 进度条满额基准(元), 余额达到此值进度条全亮
+  intervalMin: 360,      // 刷新间隔(分钟)
+  useGradientBar: true,
+  maskCustCode: true,
 };
-const pad2 = v => String(v).padStart(2, '0');
-function stamp(ms) {
-  if (!ms) return '尚未查询';
-  const d = new Date(ms);
-  return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+const tone = (light, dark) => Color.dynamic(new Color(light), new Color(dark));
+const subColor = () => tone('#6B7280', '#9CA3AF');
+const cardColor = () => tone('#F8FAFC', '#161E2E');
+const cardLite = () => tone('#F3F4F6', '#1F2937');
+const bgWhite = () => tone('#FFFFFF', '#111827');
+const dividerColor = () => tone('#E5E7EB', '#1F2937');
+const widgetColor = () => tone('#111827', '#F9FAFB');
+
+function getScale() {
+  try {
+    const s = Device.screenSize();
+    const map = [
+      [440, 956, 1.0], [430, 932, 0.98], [428, 926, 0.97], [414, 896, 0.95],
+      [402, 874, 0.93], [393, 852, 0.90], [390, 844, 0.89], [375, 812, 0.85],
+    ];
+    const m = map.find(d => (d[0] === s.width && d[1] === s.height) || (d[0] === s.height && d[1] === s.width));
+    return m ? m[2] : 0.95;
+  } catch (_) { return 0.95; }
 }
-function font(size, weight = 'medium', rounded = false) {
-  const method = rounded ? (weight === 'bold' ? 'boldRoundedSystemFont' : 'semiboldRoundedSystemFont') : (weight === 'bold' ? 'semiboldSystemFont' : 'mediumSystemFont');
-  return typeof Font[method] === 'function' ? Font[method](size) : (weight === 'bold' ? Font.boldSystemFont(size) : Font.mediumSystemFont(size));
+function getLargeWidth() {
+  try {
+    const s = Device.screenSize();
+    const map = [
+      [440, 956, 368], [430, 932, 364], [428, 926, 364], [414, 896, 360],
+      [402, 874, 348], [393, 852, 338], [390, 844, 338], [375, 812, 329],
+    ];
+    const m = map.find(d => (d[0] === Math.min(s.width, s.height) && d[1] === Math.max(s.width, s.height)));
+    return m ? m[2] : 338;
+  } catch (_) { return 338; }
 }
-function text(parent, value, size = 11, weight = 'medium', color = C.text, rounded = false) {
-  const t = parent.addText(String(value));
-  t.font = font(size, weight, rounded);
-  t.textColor = color;
-  t.lineLimit = 1;
-  t.minimumScaleFactor = 0.65;
-  return t;
+function formatMoney(num) {
+  const v = parseFloat(num);
+  return isNaN(v) ? '0.00' : v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
-function row(p) { const r = p.addStack(); r.layoutHorizontally(); r.centerAlignContent(); return r; }
-function col(p) { const r = p.addStack(); r.layoutVertically(); return r; }
-function symbol(p, name, size, color = C.accent) {
-  const s = SFSymbol.named(name);
-  if (!s) return;
-  const v = p.addImage(s.image);
-  v.imageSize = new Size(size, size);
-  v.tintColor = color;
+function maskCode(code) {
+  if (!code) return '--';
+  const s = String(code);
+  if (s.length >= 8) return s.slice(0, 3) + '****' + s.slice(-2);
+  return '****' + s.slice(-2);
 }
-function tile(p, padding = 8) {
-  const t = col(p);
-  t.backgroundColor = C.panel;
-  t.cornerRadius = 11;
-  t.setPadding(padding, padding, padding, padding);
-  return t;
+function shortCode(code) {
+  if (!code) return '--';
+  const s = String(code);
+  return s.length > 5 ? s.slice(-5) : s;
 }
-function setup(family) {
-  const w = new ListWidget();
-  w.backgroundColor = C.bg;
-  if (typeof LinearGradient !== 'undefined') {
-    const g = new LinearGradient();
-    g.colors = [C.bg, C.bgEnd];
-    g.locations = [0, 1];
-    g.startPoint = new Point(0, 0);
-    g.endPoint = new Point(1, 1);
-    w.backgroundGradient = g;
+function formatCompName(name) {
+  const raw = (name || '').trim();
+  if (!raw || raw === 'undefined' || raw === 'null') return '兴能燃气';
+  return raw.replace(/有限责任公司|有限公司|天然气发展有限公司/g, '');
+}
+function getBalanceRatio(data) {
+  const isOwe = data.arrears && parseFloat(data.arrears) > 0;
+  if (isOwe) return 0;
+  const bal = parseFloat(data.balance);
+  if (isNaN(bal) || bal <= 0) return 0;
+  const maxLimit = parseFloat(UI_SETTINGS.balanceLimit) || 500;
+  return Math.max(0, Math.min(1.0, bal / maxLimit));
+}
+function getCapsuleActiveCount(data, total = 10) {
+  const isOwe = data.arrears && parseFloat(data.arrears) > 0;
+  if (isOwe) return 1;
+  const ratio = getBalanceRatio(data);
+  if (ratio <= 0) return 0;
+  return Math.max(1, Math.round(ratio * total));
+}
+function getBarColors(data) {
+  if (!UI_SETTINGS.useGradientBar) {
+    const single = UI_SETTINGS.themeColor;
+    return { start: single, end: single };
   }
-  const p = family === 'small' ? 11 : (family === 'large' ? 16 : 14);
-  w.setPadding(p, p, p, p);
-  w.url = URLScheme.forRunningScript();
-  w.refreshAfterDate = new Date(Date.now() + 4 * 60 * 60 * 1000);
-  return w;
+  const isOwe = data.arrears && parseFloat(data.arrears) > 0;
+  if (isOwe) return { start: '#EF4444', end: '#DC2626' };
+  const ratio = getBalanceRatio(data);
+  if (ratio >= 0.8) return { start: '#10B981', end: '#34D399' };
+  if (ratio >= 0.6) return { start: '#06B6D4', end: '#22D3EE' };
+  if (ratio >= 0.4) return { start: '#EAB308', end: '#FACC15' };
+  if (ratio >= 0.2) return { start: '#F97316', end: '#FB923C' };
+  return { start: '#EF4444', end: '#F87171' };
 }
-function header(w, data, compact = false) {
-  const r = row(w);
-  const badge = row(r);
-  badge.backgroundColor = C.iconBg;
-  badge.cornerRadius = 6;
-  badge.setPadding(3, 3, 3, 3);
-  symbol(badge, 'flame.fill', 13);
-  r.addSpacer(6);
-  text(r, '兴能燃气', compact ? 12 : 13, 'bold');
-  r.addSpacer();
-  if (data && data.arrears > 0) text(r, '有欠费', 9, 'medium', C.alert);
-  else if (!compact) text(r, '账户余额', 10, 'medium', C.muted);
+function interpolateColor(c1hex, c2hex, factor) {
+  try {
+    const c1 = parseInt(c1hex.replace('#', ''), 16);
+    const c2 = parseInt(c2hex.replace('#', ''), 16);
+    const r = Math.round(((c1 >> 16) & 255) + (((c2 >> 16) & 255) - ((c1 >> 16) & 255)) * factor);
+    const g = Math.round(((c1 >> 8) & 255) + (((c2 >> 8) & 255) - ((c1 >> 8) & 255)) * factor);
+    const b = Math.round((c1 & 255) + ((c2 & 255) - (c1 & 255)) * factor);
+    return new Color('#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1));
+  } catch (_) { return new Color(c1hex); }
 }
-function formatMoney(v, digits = 2) {
-  return v === null || v === undefined || !Number.isFinite(Number(v)) ? '—' : Number(v).toFixed(digits);
+function drawCapsuleBar(width, height, totalSegments, activeSegments, colors) {
+  const dc = new DrawContext();
+  dc.size = new Size(width, height);
+  dc.opaque = false;
+  dc.respectScreenScale = true;
+  const gap = 3.5;
+  const segW = (width - gap * (totalSegments - 1)) / totalSegments;
+  const corner = height / 2;
+  const bg = Color.dynamic(new Color('#E5E7EB'), new Color('#374151'));
+  for (let i = 0; i < totalSegments; i++) {
+    const x = i * (segW + gap);
+    const path = new Path();
+    path.addRoundedRect(new Rect(x, 0, segW, height), corner, corner);
+    dc.addPath(path);
+    if (i < activeSegments) {
+      const f = activeSegments > 1 ? (i / (activeSegments - 1)) : 0;
+      dc.setFillColor(interpolateColor(colors.start, colors.end, f));
+    } else {
+      dc.setFillColor(bg);
+    }
+    dc.fillPath();
+  }
+  return dc.getImage();
 }
-function amount(parent, data, size) {
-  const value = formatMoney(data.balance);
-  const len = value.length;
-  text(parent, value, Math.min(size, len > 9 ? 26 : len > 7 ? 30 : size), 'bold', C.accent, true);
-}
-function footer(w, result, compact = false) {
-  const r = row(w);
-  text(r, `更新 ${stamp(result.updatedAt)}`, compact ? 9 : 9.5, 'medium', C.muted);
-  r.addSpacer();
-  if (result.stale) text(r, '上次成功', 9, 'medium', C.alert);
-}
-function small(result) {
-  const d = result.data, w = setup('small');
-  header(w, d, true);
-  w.addSpacer(6);
-  const caption = row(w);
-  text(caption, '账户余额 · 元', 9, 'medium', C.muted);
-  caption.addSpacer();
-  text(caption, d.arrears > 0 ? `待缴 ¥${formatMoney(d.arrears)}` : '无欠费', 8.5, 'medium', d.arrears > 0 ? C.alert : C.ok);
-  amount(w, d, 33);
-  w.addSpacer(5);
-  const panel = row(w);
-  panel.backgroundColor = C.panel;
-  panel.cornerRadius = 10;
-  panel.setPadding(5, 7, 5, 7);
-  const left = col(panel);
-  text(left, '上期余额', 8.5, 'medium', C.muted);
-  text(left, formatMoney(d.lastBalance), 12, 'bold', C.text, true);
-  panel.addSpacer();
-  const right = col(panel);
-  text(right, '户号', 8.5, 'medium', C.muted);
-  text(right, String(d.consNo || '—').slice(-4), 12, 'bold', C.text, true);
-  w.addSpacer();
-  w.addSpacer(5);
-  footer(w, result, true);
-  return w;
-}
-function medium(result) {
-  const d = result.data, w = setup('medium');
-  header(w, d);
-  w.addSpacer(8);
-  const r = w.addStack();
-  r.layoutHorizontally();
-  r.topAlignContent();
-  const left = col(r);
-  left.size = new Size(124, 0);
-  text(left, '账户余额 · 元', 10, 'medium', C.muted);
-  left.addSpacer(2);
-  amount(left, d, 35);
-  left.addSpacer(1);
-  text(left, d.arrears > 0 ? `待缴 ¥${formatMoney(d.arrears)}` : '无欠费', 10, 'medium', d.arrears > 0 ? C.alert : C.ok);
-  r.addSpacer(12);
-  r.addSpacer();
-  const t = tile(r, 8);
-  t.size = new Size(134, 0);
-  const l1 = row(t);
-  text(l1, '上期余额', 9, 'medium', C.muted);
-  l1.addSpacer();
-  const v1 = row(t);
-  text(v1, formatMoney(d.lastBalance), 20, 'bold', C.text, true);
-  v1.addSpacer(3);
-  text(v1, '元', 10, 'medium', C.muted);
-  t.addSpacer(3);
-  text(t, `户号 ${d.consNo || '—'}`, 9, 'medium', C.muted);
-  w.addSpacer();
-  w.addSpacer(5);
-  footer(w, result);
-  return w;
-}
-function large(result) {
-  const d = result.data, w = setup('large');
-  header(w, d);
-  w.addSpacer(14);
-  const r = w.addStack();
-  r.layoutHorizontally();
-  r.topAlignContent();
-  const left = col(r);
-  left.size = new Size(128, 0);
-  text(left, '账户余额 · 元', 10, 'medium', C.muted);
-  left.addSpacer(2);
-  amount(left, d, 39);
-  left.addSpacer(1);
-  text(left, d.arrears > 0 ? `待缴 ¥${formatMoney(d.arrears)}` : '无欠费', 10, 'medium', d.arrears > 0 ? C.alert : C.ok);
-  r.addSpacer(12);
-  r.addSpacer();
-  const t = tile(r, 8);
-  t.size = new Size(142, 0);
-  const l1 = row(t);
-  text(l1, '上期余额', 9, 'medium', C.muted);
-  l1.addSpacer();
-  const v1 = row(t);
-  text(v1, formatMoney(d.lastBalance), 24, 'bold', C.text, true);
-  v1.addSpacer(3);
-  text(v1, '元', 10, 'medium', C.muted);
-  t.addSpacer(3);
-  text(t, `户名 ${d.consName || '—'}`, 9, 'medium', C.muted);
-  w.addSpacer(14);
-  const info = tile(w, 11);
-  const r1 = row(info);
-  text(r1, '户号', 10, 'medium', C.muted);
+// ---- 小号 ----
+function renderSmall(w, data, isOffline) {
+  const SCALE = getScale();
+  const pX = 14 * SCALE, pY = 12 * SCALE;
+  w.setPadding(pY, pX, pY, pX);
+  w.backgroundColor = bgWhite();
+  const themeColor = new Color(UI_SETTINGS.themeColor);
+  const balanceColor = new Color(UI_SETTINGS.balanceColor);
+  const sub = subColor();
+  const isOwe = data.arrears && parseFloat(data.arrears) > 0;
+  const body = w.addStack();
+  body.layoutVertically();
+  // header
+  const header = body.addStack();
+  header.centerAlignContent();
+  const flame = SFSymbol.named('flame.fill');
+  flame.applyHeavyWeight();
+  const icon = header.addImage(flame.image);
+  icon.imageSize = new Size(16 * SCALE, 16 * SCALE);
+  icon.tintColor = themeColor;
+  header.addSpacer(5);
+  const title = header.addText(UI_SETTINGS.alias);
+  title.font = Font.boldSystemFont(13 * SCALE);
+  title.textColor = widgetColor();
+  header.addSpacer();
+  const pill = header.addStack();
+  pill.centerAlignContent();
+  pill.backgroundColor = tone('#F3F4F6', '#1F2937');
+  pill.cornerRadius = 6 * SCALE;
+  pill.setPadding(2 * SCALE, 6 * SCALE, 2 * SCALE, 6 * SCALE);
+  const pillT = pill.addText(isOffline ? '离线' : '● 正常');
+  pillT.font = Font.semiboldSystemFont(9.5 * SCALE);
+  pillT.textColor = isOffline ? themeColor : balanceColor;
+  body.addSpacer();
+  // 余额
+  const labelRow = body.addStack();
+  labelRow.centerAlignContent();
+  const balLabel = labelRow.addText(isOwe ? '燃气欠费' : '账户余额');
+  balLabel.font = Font.mediumSystemFont(11 * SCALE);
+  balLabel.textColor = isOwe ? new Color('#EF4444') : sub;
+  body.addSpacer(2 * SCALE);
+  const valRow = body.addStack();
+  valRow.centerAlignContent();
+  const valText = valRow.addText(`¥ ${formatMoney(data.balance)}`);
+  valText.font = Font.boldRoundedSystemFont(27 * SCALE);
+  valText.textColor = isOwe ? new Color('#EF4444') : balanceColor;
+  valText.lineLimit = 1;
+  valText.minimumScaleFactor = 0.6;
+  body.addSpacer(6 * SCALE);
+  // 胶囊进度条
+  const active = getCapsuleActiveCount(data, 10);
+  const colors = getBarColors(data);
+  const capImg = body.addImage(drawCapsuleBar(130 * SCALE, 5.5 * SCALE, 10, active, colors));
+  capImg.imageSize = new Size(130 * SCALE, 5.5 * SCALE);
+  body.addSpacer();
+  // 底部卡片
+  const card = body.addStack();
+  card.layoutVertically();
+  card.backgroundColor = cardColor();
+  card.cornerRadius = 8 * SCALE;
+  card.setPadding(6 * SCALE, 8 * SCALE, 6 * SCALE, 8 * SCALE);
+  const r1 = card.addStack();
+  r1.centerAlignContent();
+  const gIcon = SFSymbol.named('gauge.badge.plus');
+  const gImg = r1.addImage(gIcon.image);
+  gImg.imageSize = new Size(11 * SCALE, 11 * SCALE);
+  gImg.tintColor = themeColor;
+  r1.addSpacer(3);
+  const mText = r1.addText(`上期: ¥${formatMoney(data.lastBalance)}`);
+  mText.font = Font.systemFont(9.5 * SCALE);
+  mText.textColor = sub;
   r1.addSpacer();
-  text(r1, d.consNo || '—', 12, 'bold', C.text);
-  info.addSpacer(6);
-  const r2 = row(info);
-  text(r2, '气种', 10, 'medium', C.muted);
+  const timeText = r1.addText(stamp(data.updatedAt));
+  timeText.font = Font.systemFont(9.5 * SCALE);
+  timeText.textColor = sub;
+  card.addSpacer(3 * SCALE);
+  const r2 = card.addStack();
+  r2.centerAlignContent();
+  const idIcon = SFSymbol.named('creditcard');
+  const idImg = r2.addImage(idIcon.image);
+  idImg.imageSize = new Size(11 * SCALE, 11 * SCALE);
+  idImg.tintColor = new Color('#3B82F6');
+  r2.addSpacer(3);
+  const codeText = r2.addText(`户号: ${UI_SETTINGS.maskCustCode ? maskCode(data.consNo) : shortCode(data.consNo)}`);
+  codeText.font = Font.systemFont(9.5 * SCALE);
+  codeText.textColor = sub;
   r2.addSpacer();
-  text(r2, d.gasPropName || '—', 12, 'bold', C.text);
-  info.addSpacer(6);
-  const r3 = row(info);
-  text(r3, '余额刷新', 10, 'medium', C.muted);
-  r3.addSpacer();
-  text(r3, d.preBalanceTime ? stamp(Number(d.preBalanceTime)) : '—', 11, 'bold', C.text);
-  if (d.gasAddress) {
-    info.addSpacer(6);
-    const r4 = row(info);
-    text(r4, '地址', 10, 'medium', C.muted);
-    r4.addSpacer();
-    const a = text(r4, d.gasAddress, 11, 'medium', C.text);
-    a.lineLimit = 2;
-  }
-  w.addSpacer();
-  w.addSpacer(7);
-  footer(w, result);
+  const nameText = r2.addText(data.consName || '兴能燃气');
+  nameText.font = Font.systemFont(9.5 * SCALE);
+  nameText.textColor = sub;
   return w;
 }
-function make(result, family = 'medium') {
-  if (family === 'small') return small(result);
-  if (family === 'large') return large(result);
-  return medium(result);
+// ---- 中号 ----
+function renderMedium(w, data, isOffline) {
+  const SCALE = getScale();
+  const pX = 16 * SCALE, pY = 12 * SCALE;
+  w.setPadding(pY, pX, pY, pX);
+  w.backgroundColor = bgWhite();
+  const themeColor = new Color(UI_SETTINGS.themeColor);
+  const balanceColor = new Color(UI_SETTINGS.balanceColor);
+  const sub = subColor();
+  const isOwe = data.arrears && parseFloat(data.arrears) > 0;
+  const body = w.addStack();
+  body.layoutHorizontally();
+  const left = body.addStack();
+  left.layoutVertically();
+  left.size = new Size(155 * SCALE, 0);
+  // 左 header
+  const lH = left.addStack();
+  lH.centerAlignContent();
+  const flame = SFSymbol.named('flame.fill');
+  flame.applyHeavyWeight();
+  const fImg = lH.addImage(flame.image);
+  fImg.imageSize = new Size(16 * SCALE, 16 * SCALE);
+  fImg.tintColor = themeColor;
+  lH.addSpacer(5);
+  const lTitle = lH.addText(UI_SETTINGS.alias);
+  lTitle.font = Font.boldSystemFont(13 * SCALE);
+  lTitle.textColor = widgetColor();
+  left.addSpacer();
+  const balLabel = left.addText(isOwe ? '燃气欠费 (元)' : '账户余额 (元)');
+  balLabel.font = Font.mediumSystemFont(11 * SCALE);
+  balLabel.textColor = isOwe ? new Color('#EF4444') : sub;
+  left.addSpacer(2 * SCALE);
+  const valRow = left.addStack();
+  valRow.centerAlignContent();
+  const valText = valRow.addText(`¥ ${formatMoney(data.balance)}`);
+  valText.font = Font.boldRoundedSystemFont(28 * SCALE);
+  valText.textColor = isOwe ? new Color('#EF4444') : balanceColor;
+  valText.lineLimit = 1;
+  valText.minimumScaleFactor = 0.6;
+  left.addSpacer(7 * SCALE);
+  const active = getCapsuleActiveCount(data, 10);
+  const colors = getBarColors(data);
+  const capImg = left.addImage(drawCapsuleBar(148 * SCALE, 7 * SCALE, 10, active, colors));
+  capImg.imageSize = new Size(148 * SCALE, 7 * SCALE);
+  left.addSpacer();
+  const stateRow = left.addStack();
+  stateRow.centerAlignContent();
+  const dot = stateRow.addText('● ');
+  dot.font = Font.systemFont(8 * SCALE);
+  dot.textColor = isOwe ? new Color('#EF4444') : balanceColor;
+  const stateT = stateRow.addText(isOwe ? '账户已欠费 · 请及时充值' : isOffline ? '离线数据 · 网络不可用' : '账户正常 · 民用阶梯');
+  stateT.font = Font.systemFont(10 * SCALE);
+  stateT.textColor = sub;
+  body.addSpacer(12 * SCALE);
+  const divider = body.addStack();
+  divider.size = new Size(1, 0);
+  divider.backgroundColor = dividerColor();
+  body.addSpacer(12 * SCALE);
+  const right = body.addStack();
+  right.layoutVertically();
+  const rTop = right.addStack();
+  rTop.centerAlignContent();
+  const syncSym = SFSymbol.named('arrow.triangle.2.circlepath');
+  const syncImg = rTop.addImage(syncSym.image);
+  syncImg.imageSize = new Size(10 * SCALE, 10 * SCALE);
+  syncImg.tintColor = sub;
+  rTop.addSpacer(3);
+  const syncT = rTop.addText(`更新 ${stamp(data.updatedAt)}`);
+  syncT.font = Font.systemFont(10 * SCALE);
+  syncT.textColor = sub;
+  rTop.addSpacer();
+  right.addSpacer();
+  techRow(right, 'person.crop.rectangle', '客户户号', `${data.consName || '--'}`, themeColor, sub, SCALE);
+  right.addSpacer();
+  techRow(right, 'number', '燃气户号', UI_SETTINGS.maskCustCode ? maskCode(data.consNo) : String(data.consNo || '--'), new Color('#3B82F6'), sub, SCALE);
+  right.addSpacer();
+  techRow(right, 'speedometer', '上期余额', `¥${formatMoney(data.lastBalance)}`, new Color('#8B5CF6'), sub, SCALE);
+  right.addSpacer();
+  techRow(right, 'building.2', '服务单位', formatCompName('双流兴能天然气有限责任公司'), new Color('#10B981'), sub, SCALE);
+  return w;
+}
+function techRow(parent, iconName, label, valStr, iconCol, subCol, SCALE) {
+  const r = parent.addStack();
+  r.centerAlignContent();
+  const sym = SFSymbol.named(iconName);
+  const img = r.addImage(sym.image);
+  img.imageSize = new Size(13 * SCALE, 13 * SCALE);
+  img.tintColor = iconCol;
+  r.addSpacer(4);
+  const lT = r.addText(label);
+  lT.font = Font.systemFont(10.5 * SCALE);
+  lT.textColor = subCol;
+  r.addSpacer(6);
+  const vT = r.addText(valStr);
+  vT.font = Font.semiboldSystemFont(11 * SCALE);
+  vT.textColor = widgetColor();
+  vT.lineLimit = 1;
+  vT.minimumScaleFactor = 0.7;
+  r.addSpacer();
+}
+// ---- 大号 ----
+function renderLarge(w, data, isOffline) {
+  const SCALE = getScale();
+  const pX = 16 * SCALE, pY = 14 * SCALE;
+  w.setPadding(pY, pX, pY, pX);
+  w.backgroundColor = bgWhite();
+  const themeColor = new Color(UI_SETTINGS.themeColor);
+  const balanceColor = new Color(UI_SETTINGS.balanceColor);
+  const sub = subColor();
+  const isOwe = data.arrears && parseFloat(data.arrears) > 0;
+  const body = w.addStack();
+  body.layoutVertically();
+  // header
+  const header = body.addStack();
+  header.centerAlignContent();
+  const flame = SFSymbol.named('flame.fill');
+  flame.applyHeavyWeight();
+  const fImg = header.addImage(flame.image);
+  fImg.imageSize = new Size(20 * SCALE, 20 * SCALE);
+  fImg.tintColor = themeColor;
+  header.addSpacer(6);
+  const title = header.addText(UI_SETTINGS.alias);
+  title.font = Font.boldSystemFont(15 * SCALE);
+  title.textColor = widgetColor();
+  header.addSpacer();
+  const badge = header.addStack();
+  badge.centerAlignContent();
+  badge.backgroundColor = tone('#F3F4F6', '#1F2937');
+  badge.cornerRadius = 6 * SCALE;
+  badge.setPadding(3 * SCALE, 8 * SCALE, 3 * SCALE, 8 * SCALE);
+  const tag = badge.addText(isOffline ? '离线模式' : `更新 ${stamp(data.updatedAt)}`);
+  tag.font = Font.semiboldSystemFont(10 * SCALE);
+  tag.textColor = isOffline ? themeColor : balanceColor;
+  body.addSpacer();
+  // 余额卡片
+  const card = body.addStack();
+  card.layoutVertically();
+  card.backgroundColor = cardColor();
+  card.cornerRadius = 14 * SCALE;
+  card.setPadding(12 * SCALE, 16 * SCALE, 12 * SCALE, 16 * SCALE);
+  const cLabel = card.addText(isOwe ? '账户欠费总额 (元)' : '当前账户余额 (元)');
+  cLabel.font = Font.mediumSystemFont(11.5 * SCALE);
+  cLabel.textColor = isOwe ? new Color('#EF4444') : sub;
+  card.addSpacer(3 * SCALE);
+  const cValRow = card.addStack();
+  cValRow.centerAlignContent();
+  const val = cValRow.addText(`¥ ${formatMoney(data.balance)}`);
+  val.font = Font.boldRoundedSystemFont(33 * SCALE);
+  val.textColor = isOwe ? new Color('#EF4444') : balanceColor;
+  card.addSpacer(7 * SCALE);
+  const contentW = getLargeWidth() - 2 * pX;
+  const barW = Math.max(260 * SCALE, contentW - 32 * SCALE);
+  const active = getCapsuleActiveCount(data, 14);
+  const colors = getBarColors(data);
+  const cap = card.addImage(drawCapsuleBar(barW, 8 * SCALE, 14, active, colors));
+  cap.imageSize = new Size(barW, 8 * SCALE);
+  body.addSpacer();
+  // 三卡片
+  const grid = body.addStack();
+  grid.layoutHorizontally();
+  const gap = 8 * SCALE;
+  const colW = Math.floor((contentW - 2 * gap) / 3);
+  const colW3 = contentW - 2 * gap - 2 * colW;
+  const cardA = grid.addStack();
+  cardA.layoutVertically();
+  cardA.backgroundColor = cardLite();
+  cardA.cornerRadius = 10 * SCALE;
+  cardA.setPadding(9 * SCALE, 9 * SCALE, 9 * SCALE, 9 * SCALE);
+  cardA.size = new Size(colW, 0);
+  const aHead = cardA.addStack();
+  aHead.centerAlignContent();
+  const aIcon = SFSymbol.named('speedometer');
+  const aImg = aHead.addImage(aIcon.image);
+  aImg.imageSize = new Size(12 * SCALE, 12 * SCALE);
+  aImg.tintColor = new Color('#3B82F6');
+  aHead.addSpacer(3 * SCALE);
+  const aTitle = aHead.addText('上期余额');
+  aTitle.font = Font.systemFont(10 * SCALE);
+  aTitle.textColor = sub;
+  aTitle.lineLimit = 1;
+  cardA.addSpacer(4 * SCALE);
+  const aVal = cardA.addText(`¥${formatMoney(data.lastBalance)}`);
+  aVal.font = Font.boldRoundedSystemFont(16 * SCALE);
+  aVal.textColor = widgetColor();
+  aVal.lineLimit = 1;
+  aVal.minimumScaleFactor = 0.8;
+  grid.addSpacer(gap);
+  const cardB = grid.addStack();
+  cardB.layoutVertically();
+  cardB.backgroundColor = cardLite();
+  cardB.cornerRadius = 10 * SCALE;
+  cardB.setPadding(9 * SCALE, 9 * SCALE, 9 * SCALE, 9 * SCALE);
+  cardB.size = new Size(colW, 0);
+  const bHead = cardB.addStack();
+  bHead.centerAlignContent();
+  const bIcon = SFSymbol.named('flame.circle');
+  const bImg = bHead.addImage(bIcon.image);
+  bImg.imageSize = new Size(12 * SCALE, 12 * SCALE);
+  bImg.tintColor = new Color('#8B5CF6');
+  bHead.addSpacer(3 * SCALE);
+  const bTitle = bHead.addText('气价类型');
+  bTitle.font = Font.systemFont(10 * SCALE);
+  bTitle.textColor = sub;
+  bTitle.lineLimit = 1;
+  cardB.addSpacer(4 * SCALE);
+  const bVal = cardB.addText(data.gasPropName || '--');
+  bVal.font = Font.boldRoundedSystemFont(13.5 * SCALE);
+  bVal.textColor = widgetColor();
+  bVal.lineLimit = 1;
+  bVal.minimumScaleFactor = 0.8;
+  grid.addSpacer(gap);
+  const cardC = grid.addStack();
+  cardC.layoutVertically();
+  cardC.backgroundColor = cardLite();
+  cardC.cornerRadius = 10 * SCALE;
+  cardC.setPadding(9 * SCALE, 9 * SCALE, 9 * SCALE, 9 * SCALE);
+  cardC.size = new Size(colW3, 0);
+  const cHead = cardC.addStack();
+  cHead.centerAlignContent();
+  const cIcon = SFSymbol.named('waveform.path.ecg');
+  const cImg = cHead.addImage(cIcon.image);
+  cImg.imageSize = new Size(12 * SCALE, 12 * SCALE);
+  const statusCol = isOwe ? new Color('#EF4444') : (isOffline ? themeColor : balanceColor);
+  cImg.tintColor = statusCol;
+  cHead.addSpacer(3 * SCALE);
+  const cTitle = cHead.addText('账户状态');
+  cTitle.font = Font.systemFont(10 * SCALE);
+  cTitle.textColor = sub;
+  cTitle.lineLimit = 1;
+  cardC.addSpacer(4 * SCALE);
+  const cRow = cardC.addStack();
+  cRow.centerAlignContent();
+  const cDot = cRow.addText('● ');
+  cDot.font = Font.systemFont(7 * SCALE);
+  cDot.textColor = statusCol;
+  const cValT = isOwe ? '账户欠费' : (isOffline ? '离线保持' : '余额充足');
+  const cVal = cRow.addText(cValT);
+  cVal.font = Font.boldSystemFont(12 * SCALE);
+  cVal.textColor = widgetColor();
+  cVal.lineLimit = 1;
+  cVal.minimumScaleFactor = 0.8;
+  body.addSpacer();
+  // 列表卡
+  const listCard = body.addStack();
+  listCard.layoutVertically();
+  listCard.backgroundColor = cardColor();
+  listCard.cornerRadius = 10 * SCALE;
+  listCard.setPadding(10 * SCALE, 14 * SCALE, 10 * SCALE, 14 * SCALE);
+  techRow(listCard, 'person.crop.rectangle', '客户姓名', data.consName || '--', themeColor, sub, SCALE);
+  listCard.addSpacer(6 * SCALE);
+  techRow(listCard, 'number', '燃气户号', UI_SETTINGS.maskCustCode ? maskCode(data.consNo) : String(data.consNo || '--'), new Color('#3B82F6'), sub, SCALE);
+  listCard.addSpacer(6 * SCALE);
+  techRow(listCard, 'building.2', '服务单位', formatCompName('双流兴能天然气有限责任公司'), new Color('#10B981'), sub, SCALE);
+  listCard.addSpacer(6 * SCALE);
+  techRow(listCard, 'phone.badge.waveform', '服务热线', '028-85860568', new Color('#F59E0B'), sub, SCALE);
+  return w;
+}
+// ---- 占位/错误 ----
+function renderGuideWidget(w) {
+  w.setPadding(16, 16, 16, 16);
+  w.backgroundColor = bgWhite();
+  const center = w.addStack();
+  center.layoutVertically();
+  center.centerAlignContent();
+  const title = center.addText('兴能燃气');
+  title.font = Font.boldSystemFont(15);
+  title.textColor = new Color('#FF9500');
+  center.addSpacer(8);
+  const tip = center.addText('未检测到 Token 配置');
+  tip.font = Font.boldSystemFont(12);
+  tip.textColor = widgetColor();
+  center.addSpacer(4);
+  const desc = center.addText('请点击打开组件，选择「填写 Token」。');
+  desc.font = Font.systemFont(11);
+  desc.textColor = new Color('#9CA3AF');
+  desc.centerAlignText();
+  return w;
+}
+function renderErrorWidget(w, msg) {
+  w.setPadding(16, 16, 16, 16);
+  w.backgroundColor = bgWhite();
+  const center = w.addStack();
+  center.layoutVertically();
+  center.centerAlignContent();
+  const title = center.addText('数据连接失败');
+  title.font = Font.boldSystemFont(14);
+  title.textColor = new Color('#EF4444');
+  center.addSpacer(6);
+  const m = center.addText((msg || '网络超时且无离线缓存，请检查网络或重新配置 Token。').slice(0, 60));
+  m.font = Font.systemFont(11);
+  m.textColor = new Color('#9CA3AF');
+  m.centerAlignText();
+  m.lineLimit = 4;
+  return w;
+}
+function makeWidget(result, family) {
+  const w = new ListWidget();
+  w.refreshAfterDate = new Date(Date.now() + 1000 * 60 * UI_SETTINGS.intervalMin);
+  w.url = URLScheme.forRunningScript();
+  const d = result.data;
+  if (family === 'medium') return renderMedium(w, d, result.stale);
+  if (family === 'large') return renderLarge(w, d, result.stale);
+  return renderSmall(w, d, result.stale);
+}
+function stamp(ms) {
+  if (!ms) return '--';
+  const d = new Date(ms);
+  const p = v => String(v).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 function placeholder(hint) {
   const family = config.widgetFamily || 'medium';
-  const w = setup(family);
-  header(w, null, family === 'small');
-  w.addSpacer(12);
-  const msg = text(w, hint || '请打开脚本填写 Token', family === 'small' ? 11 : 13, 'medium', C.muted);
-  msg.lineLimit = 4;
-  w.addSpacer();
-  text(w, '打开脚本完成配置', family === 'small' ? 8 : 9, 'medium', C.muted);
-  return w;
+  const w = new ListWidget();
+  w.refreshAfterDate = new Date(Date.now() + 1000 * 60 * UI_SETTINGS.intervalMin);
+  w.url = URLScheme.forRunningScript();
+  if (family === 'medium') return renderGuideWidget(w);
+  if (family === 'large') return renderGuideWidget(w);
+  return renderGuideWidget(w);
 }
 
 // ================= 缓存 =================
@@ -591,26 +902,21 @@ async function runWidget() {
   const family = config.widgetFamily || 'medium';
   let cached = null;
   try { cached = readCache(); } catch (_) {}
-  // 4小时内直接使用缓存, 避免频繁请求
-  if (cached && cached.updatedAt && Date.now() - cached.updatedAt < 4 * 60 * 60 * 1000) {
-    const w = make({ data: cached, updatedAt: cached.updatedAt, stale: false }, family);
-    Script.setWidget(w);
+  if (cached && cached.updatedAt && Date.now() - cached.updatedAt < UI_SETTINGS.intervalMin * 60 * 1000) {
+    Script.setWidget(makeWidget({ data: cached, updatedAt: cached.updatedAt, stale: false }, family));
     Script.complete();
     return;
   }
   try {
     const data = await queryBalance();
     writeCache(data);
-    const w = make({ data, updatedAt: data.updatedAt, stale: false }, family);
-    Script.setWidget(w);
+    Script.setWidget(makeWidget({ data, updatedAt: data.updatedAt, stale: false }, family));
     Script.complete();
   } catch (e) {
     if (cached) {
-      const w = make({ data: cached, updatedAt: cached.updatedAt, stale: true }, family);
-      Script.setWidget(w);
+      Script.setWidget(makeWidget({ data: cached, updatedAt: cached.updatedAt, stale: true }, family));
     } else {
-      const w = placeholder(e.message || String(e));
-      Script.setWidget(w);
+      Script.setWidget(renderErrorWidget(new ListWidget(), e.message || String(e)));
     }
     Script.complete();
   }
@@ -646,7 +952,7 @@ async function runApp() {
     try {
       const data = await queryBalance();
       writeCache(data);
-      const w = make({ data, updatedAt: data.updatedAt, stale: false }, family);
+      const w = makeWidget({ data, updatedAt: data.updatedAt, stale: false }, family);
       if (family === 'small') await w.presentSmall();
       else if (family === 'large') await w.presentLarge();
       else await w.presentMedium();
