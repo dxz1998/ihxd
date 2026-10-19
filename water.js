@@ -1,7 +1,7 @@
 /*
 
 [rewrite_local]
-^https:\/\/m\.cdmjwater\.com\/api\/.* url script-request-header https://raw.githubusercontent.com/dxz1998/ihxd/refs/heads/main/water_cookie.js
+^https:\/\/m\.cdmjwater\.com\/api\/.* url script-request-header https://raw.githubusercontent.com/dxz1998/ihxd/refs/heads/main/water.js
 
 [mitm]
 hostname = m.cdmjwater.com
