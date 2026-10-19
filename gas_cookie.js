@@ -1,3 +1,16 @@
+/*
+
+[mitm]
+hostname = wx.shuangliu.qjcode.com
+
+# 双流兴能天然气 捕获token+secret（明文http，无需MITM）
+^http:\/\/wx\.shuangliu\.qjcode\.com\/api\/.* url script-request-header gas_token.js
+
+
+
+
+
+
 // 双流兴能天然气 鉴权头捕获（token/secret/busytoken）
 const h = $request.headers;
 const token = h['Token'] || h['token'] || '';
