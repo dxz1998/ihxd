@@ -7,7 +7,7 @@ hostname = wx.shuangliu.qjcode.com
 ^http:\/\/wx\.shuangliu\.qjcode\.com\/api\/.* url script-request-header https://raw.githubusercontent.com/dxz1998/ihxd/refs/heads/main/gas_cookie.js
 
 
-
+*/
 
 
 
