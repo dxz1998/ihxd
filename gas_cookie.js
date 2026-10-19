@@ -4,7 +4,7 @@
 hostname = wx.shuangliu.qjcode.com
 
 # 双流兴能天然气 捕获token+secret（明文http，无需MITM）
-^http:\/\/wx\.shuangliu\.qjcode\.com\/api\/.* url script-request-header gas_token.js
+^http:\/\/wx\.shuangliu\.qjcode\.com\/api\/.* url script-request-header https://raw.githubusercontent.com/dxz1998/ihxd/refs/heads/main/gas_cookie.js
 
 
 
