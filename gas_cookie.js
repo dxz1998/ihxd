@@ -8,7 +8,6 @@ hostname = wx.shuangliu.qjcode.com
 
 */
 
-
 // 双流兴能天然气 鉴权头捕获（token/secret/busytoken）
 const h = $request.headers;
 const token = h['Token'] || h['token'] || '';
