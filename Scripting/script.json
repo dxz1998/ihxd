@@ -1,0 +1,9 @@
+{
+  "remoteResource": null,
+  "icon": "drop.fill",
+  "runInApp": true,
+  "intentInputTypes": [],
+  "color": "rgba(255, 149, 0, 1.00)",
+  "description": "米家山水务 - 成都岷江自来水厂水费余额查询小组件 (Scriptable 转 Scripting 版)",
+  "name": "米家山水务"
+}
