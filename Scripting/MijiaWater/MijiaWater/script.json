@@ -1,0 +1,13 @@
+{
+  "name": "MijiaWater",
+  "icon": "drop.fill",
+  "color": "#0EA5E9",
+  "version": "1.8.3",
+  "description": "Mijia water balance widget (Scripting port)",
+  "localizedNames": {
+    "zh": "米家山水务"
+  },
+  "localizedDescriptions": {
+    "zh": "米家山水务余额查询与桌面小组件（RSA+AES 加密链路）"
+  }
+}
