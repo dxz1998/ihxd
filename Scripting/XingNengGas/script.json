@@ -1,0 +1,18 @@
+{
+  "name": "XingNengGas",
+  "icon": "flame.fill",
+  "color": "#FF9500",
+  "version": "1.8.3",
+  "description": "XingNeng gas balance widget (Scripting port)",
+  "localizedNames": {
+    "zh": "兴能燃气"
+  },
+  "localizedDescriptions": {
+    "zh": "兴能燃气余额查询与桌面小组件（RSA+AES 加密链路）"
+  },
+  "remoteResource": {
+    "url": "https://raw.githubusercontent.com/dxz1998/ihxd/main/Scripting/XingNengGas/XingNengGas.scripting",
+    "hash": "50e3324637ef3bc82ceae0eb409af0ab",
+    "autoUpdateInterval": 86400
+  }
+}
